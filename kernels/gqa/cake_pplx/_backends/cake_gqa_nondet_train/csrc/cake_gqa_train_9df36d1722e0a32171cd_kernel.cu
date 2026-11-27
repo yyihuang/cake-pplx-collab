@@ -173,6 +173,8 @@ __device__ __forceinline__ float2 ex2_emulation_f32x2_value(float2 value) {
     asm("mov.b32 %0, %1;" : "=f"(r0) : "r"((x0r_i << 23) + p0_i));
     asm("mov.b32 %0, %1;" : "=f"(r1) : "r"((x1r_i << 23) + p1_i));
     return make_float2(r0, r1);
+#if __CUDA_ARCH__ == 1000
+#else
 }
 
 __device__ __forceinline__ void ex2_emulation_f32x2(float* x0_ptr, float* x1_ptr) {
@@ -197,6 +199,7 @@ __device__ __forceinline__ void softmax_frag_exp2_cast(
         __nv_bfloat162 bf = __float22bfloat162_rn({sv[j*2], sv[j*2+1]});
         pv[j] = reinterpret_cast<uint32_t&>(bf);
     }
+#endif
 }
 
 
@@ -555,8 +558,34 @@ kernel_cake_gqa_train_9df36d1722e0a32171cd(const __grid_constant__ CUtensorMap Q
                         s[pair * 2] = x.x;
                         s[pair * 2 + 1] = x.y;
                     }
+#if __CUDA_ARCH__ == 1000
+                    #pragma unroll
+                    for (int _le = 0; _le < 24; _le++) {
+                        s[_le] = approx_exp2(s[_le]);
+                    }
+                    float2 _exp2_pair_4 = ex2_emulation_f32x2_value(make_float2(s[24], s[25]));
+                    s[24] = _exp2_pair_4.x;
+                    s[25] = _exp2_pair_4.y;
+                    float2 _exp2_pair_5 = ex2_emulation_f32x2_value(make_float2(s[26], s[27]));
+                    s[26] = _exp2_pair_5.x;
+                    s[27] = _exp2_pair_5.y;
+                    float2 _exp2_pair_6 = ex2_emulation_f32x2_value(make_float2(s[28], s[29]));
+                    s[28] = _exp2_pair_6.x;
+                    s[29] = _exp2_pair_6.y;
+                    float2 _exp2_pair_7 = ex2_emulation_f32x2_value(make_float2(s[30], s[31]));
+                    s[30] = _exp2_pair_7.x;
+                    s[31] = _exp2_pair_7.y;
+#endif
                     unsigned int p16[16];
+#if __CUDA_ARCH__ == 1000
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 16; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(s[_lp*2 + 0], s[_lp*2+1 + 0]));
+                        p16[_lp] = *(uint32_t*)&_bf2;
+                    }
+#else
                     softmax_frag_exp2_cast(&s[0], p16, 0);
+#endif
                     int _parity_p_empty = (int)((unsigned int)t % 2) ^ 1;
                     mbarrier_wait(p_empty_addr, _parity_p_empty);
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((sp_addr + (unsigned int)(prow * 128 + (wg * 4 ^ prow & 7) * 16))), "r"(p16[0]), "r"(p16[1]), "r"(p16[2]), "r"(p16[3]) : "memory");
@@ -680,10 +709,18 @@ kernel_cake_gqa_train_9df36d1722e0a32171cd(const __grid_constant__ CUtensorMap Q
                     acc_1[i_2] = 0.0f;
                 }
             }
+#if __CUDA_ARCH__ == 1000
+            const float2 _scale2_8 = {softmax_scale, softmax_scale};
+#else
             const float2 _scale2_4 = {softmax_scale, softmax_scale};
+#endif
             #pragma unroll
             for (int _ls = 0; _ls < 32; _ls++)
+#if __CUDA_ARCH__ == 1000
+                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(acc_1)[_ls], _scale2_8);
+#else
                 mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(acc_1)[_ls], _scale2_4);
+#endif
             long long base_1 = (out_row * (long long)h_kv + (long long)h) * 256ll + (long long)hd0;
             if (store_row != 0) {
                 #pragma unroll
@@ -730,12 +767,12 @@ kernel_cake_gqa_train_9df36d1722e0a32171cd(const __grid_constant__ CUtensorMap Q
                             mbarrier_wait_cluster_hint(ds_full_addr, _parity_ds_full, 10000000);
                             mbarrier_wait_cluster_hint(qt_full_addr, _phase_qt_full, 10000000);
                             asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1070
-                            int _smem_desc_lo_0 = ((sdst_addr) >> 4) & 0x7FFF;
-                            int _smem_desc_lo_1 = (((sqt_addr) >> 4) & 0x7FFF) | 0x4000000;
-#else
+#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
                             int _smem_desc_lo_0 = ((sdst_addr) >> 4) & 0x3FFF;
                             int _smem_desc_lo_1 = (((sqt_addr) >> 4) & 0x3FFF) | 0x4000000;
+#else
+                            int _smem_desc_lo_0 = ((sdst_addr) >> 4) & 0x7FFF;
+                            int _smem_desc_lo_1 = (((sqt_addr) >> 4) & 0x7FFF) | 0x4000000;
 #endif
                             asm volatile(
                     "{\n\t"
@@ -796,12 +833,12 @@ kernel_cake_gqa_train_9df36d1722e0a32171cd(const __grid_constant__ CUtensorMap Q
                             _phase_qt_full ^= 1;
                             mbarrier_wait_cluster_hint(dot_full_addr, _phase_dot_full, 10000000);
                             asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1070
-                            int _smem_desc_lo_2 = ((sp_addr) >> 4) & 0x7FFF;
-                            int _smem_desc_lo_3 = (((sdot_addr) >> 4) & 0x7FFF) | 0x4000000;
-#else
+#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
                             int _smem_desc_lo_2 = ((sp_addr) >> 4) & 0x3FFF;
                             int _smem_desc_lo_3 = (((sdot_addr) >> 4) & 0x3FFF) | 0x4000000;
+#else
+                            int _smem_desc_lo_2 = ((sp_addr) >> 4) & 0x7FFF;
+                            int _smem_desc_lo_3 = (((sdot_addr) >> 4) & 0x7FFF) | 0x4000000;
 #endif
                             asm volatile(
                     "{\n\t"
@@ -864,12 +901,12 @@ kernel_cake_gqa_train_9df36d1722e0a32171cd(const __grid_constant__ CUtensorMap Q
                         if (i < trips) {
                             mbarrier_wait_cluster_hint(q_full_addr, _phase_q_full, 10000000);
                             asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1070
-                            int _smem_desc_lo_4 = ((sk_addr) >> 4) & 0x7FFF;
-                            int _smem_desc_lo_5 = ((sq_addr) >> 4) & 0x7FFF;
-#else
+#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
                             int _smem_desc_lo_4 = ((sk_addr) >> 4) & 0x3FFF;
                             int _smem_desc_lo_5 = ((sq_addr) >> 4) & 0x3FFF;
+#else
+                            int _smem_desc_lo_4 = ((sk_addr) >> 4) & 0x7FFF;
+                            int _smem_desc_lo_5 = ((sq_addr) >> 4) & 0x7FFF;
 #endif
                             asm volatile(
                     "{\n\t"
@@ -970,12 +1007,12 @@ kernel_cake_gqa_train_9df36d1722e0a32171cd(const __grid_constant__ CUtensorMap Q
                             _phase_q_full ^= 1;
                             mbarrier_wait_cluster_hint(do_full_addr, _phase_do_full, 10000000);
                             asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1070
-                            int _smem_desc_lo_6 = ((sv_addr) >> 4) & 0x7FFF;
-                            int _smem_desc_lo_7 = ((sdo_addr) >> 4) & 0x7FFF;
-#else
+#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
                             int _smem_desc_lo_6 = ((sv_addr) >> 4) & 0x3FFF;
                             int _smem_desc_lo_7 = ((sdo_addr) >> 4) & 0x3FFF;
+#else
+                            int _smem_desc_lo_6 = ((sv_addr) >> 4) & 0x7FFF;
+                            int _smem_desc_lo_7 = ((sdo_addr) >> 4) & 0x7FFF;
 #endif
                             asm volatile(
                     "{\n\t"
