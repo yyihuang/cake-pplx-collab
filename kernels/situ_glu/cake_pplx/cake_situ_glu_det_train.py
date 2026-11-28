@@ -13,8 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake SiTU-GLU training forward / backward of an MLP, at any width ``I`` that
-is a multiple of 256 (SM100 / SM103 / SM107), deterministic.
+Cake SiTU-GLU training forward / backward of an MLP, and the fused backward of
+a checkpointed step, at any width ``I`` that is a multiple of 256 (SM100 /
+SM103 / SM107), deterministic.
 
 Per row ``r < R`` and column ``c < I``, from the BF16 gate ``g`` and up ``u``
 (two ``[R, I]`` tensors, or one ``[R, 2I]`` tensor with the gate in columns
@@ -38,9 +39,15 @@ outputs and launches nothing), and so are ``I`` and the scalars: one build
 serves every call, with no recompilation.  ``beta`` and ``lb`` default to 4.0
 and 25.0, the values of Kimi-K3.1-Pro (``activation_situ_beta`` and
 ``activation_situ_linear_beta``).  They must be positive and finite in FP32,
-with ``2.88539 / beta``, ``2.88539 / lb``, ``beta lb``, ``beta (1 + 2^-21)``
-and ``lb (1 + 2^-21)`` finite in FP32 (``ValueError`` otherwise); the tests
-cover ``beta`` in ``[2.5, 4]`` and ``lb`` in ``[10, 40]``.
+with the FP32 quotients ``k1 = -2 log2(e) / beta`` and
+``k2 = -2 log2(e) / lb``, ``beta lb``, ``beta (1 + 2^-21)`` and
+``lb (1 + 2^-21)`` finite in FP32 (``ValueError`` otherwise); the tests cover
+``beta`` in ``[2.5, 4]`` and ``lb`` in ``[10, 40]``.
+
+Each stage may run one of several programs, chosen per call from the
+architecture, ``R`` and ``I`` (``R`` against a number of rows per SM, ``I``
+against a width band); every program of a stage stores the same bits, so the
+choice changes no output bit.
 
 The kernels take every exponential as a power of two of a negative argument
 (the approximate base-2 exponential), every tanh as ``(1 - E) / (1 + E)`` of
@@ -79,9 +86,13 @@ Mode rules:
 
 No call synchronizes the host or the device or reads tensor contents on the
 host; every kernel runs on the current torch stream of the operands' device.
-Before capturing a CUDA graph, run one eager call (or build the libraries) so
-that no JIT build happens during capture.  This module imports its backend
-package on first use and reads no environment variable.
+The program of a call depends only on host integers (``R``, ``I``, the
+architecture and the SM count), so a CUDA graph replays the programs its
+capture chose.  A program's library builds at its first launch: before
+capturing a CUDA graph, run one eager call at each ``(R, I)`` the graph
+captures (or build every library of the architecture) so that no JIT build
+happens during capture.  This module imports its backend package on first use
+and reads no environment variable.
 
 Usage::
 
@@ -94,6 +105,9 @@ Usage::
     # steps without autograd, for a caller's own torch.autograd.Function
     h = cake_situ_glu_det_train_forward(gate_up)
     d_gate_up, _ = cake_situ_glu_det_train_backward(dh, gate_up)
+
+    # the backward of a checkpointed step: h (the forward's bits) and the gradients in one launch
+    h, d_gate_up, _ = cake_situ_glu_det_train_backward_recompute(dh, gate_up)
 """
 
 from __future__ import annotations
@@ -187,7 +201,8 @@ def cake_situ_glu_det_train_forward(
         A non-tensor operand; a ``beta`` or ``lb`` that is not a Python number (a tensor would need a host read).
     ValueError
         An operand off CUDA, off the gate's device, of another dtype or shape; a width that is not a positive multiple
-        of 256; a non-finite or non-positive ``beta`` or ``lb``; ``R > 2**30``; an ``out`` of another layout.
+        of 256; a non-finite or non-positive ``beta`` or ``lb``, or one whose kernel constants are past FP32;
+        ``R > 2**30``; an ``out`` of another layout.
     RuntimeError
         A device other than SM100 (``sm_100a``), SM103 (``sm_103a``) or SM107 (``sm_107a``), also with ``R = 0``.
 
@@ -264,6 +279,69 @@ def cake_situ_glu_det_train_backward(
 
 
 @cake_api
+def cake_situ_glu_det_train_backward_recompute(
+    grad_out: torch.Tensor,
+    gate_up_or_gate: torch.Tensor,
+    up: Optional[torch.Tensor] = None,
+    *,
+    beta: float = 4.0,
+    lb: float = 25.0,
+    out: Optional[torch.Tensor] = None,
+    grad_gate_up_or_gate: Optional[torch.Tensor] = None,
+    grad_up: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    r"""Fused backward of a checkpointed step: ``h``, ``d_gate`` and ``d_up`` in one launch.
+
+    A checkpointed step that keeps only ``gate`` and ``up`` needs ``h`` again in its backward (for the down
+    projection's weight gradient).  This call stores ``h`` with the bits of :func:`cake_situ_glu_det_train_forward`
+    and ``d_gate`` and ``d_up`` with the bits of :func:`cake_situ_glu_det_train_backward`, for the same inputs on the
+    same architecture, at every ``R``, layout and program: one forward and one fused backward replace two forwards and
+    one backward.  One kernel launch (plus one copy of an input the kernels cannot read in place), no workspace.  Not
+    autograd: a caller's own ``torch.autograd.Function`` calls it (see the documentation's ``SituDown`` example).
+
+    Parameters
+    ----------
+    grad_out : torch.Tensor
+        BF16 ``[R, I]`` upstream gradient ``dh`` of ``h`` (any layout; copied once when the kernels cannot read it).
+    gate_up_or_gate, up : torch.Tensor
+        The forward's inputs (see :func:`cake_situ_glu_det_train_forward`).
+    beta, lb : float
+        The forward's scalars.  Defaults 4.0 and 25.0.
+    out : torch.Tensor, optional
+        Preallocated BF16 ``h [R, I]``, with the layout rules of the forward's ``out``.
+    grad_gate_up_or_gate, grad_up : torch.Tensor, optional
+        Preallocated gradients, as for :func:`cake_situ_glu_det_train_backward`.  No output may overlap any input or
+        another output (not checked).
+
+    Returns
+    -------
+    tuple
+        ``(h, d_gate_up, None)`` for a merged input (``d_gate_up`` BF16 ``[R, 2I]``), ``(h, d_gate, d_up)`` for two
+        tensors (BF16 ``[R, I]`` each); ``h`` is BF16 ``[R, I]``; new tensors are contiguous.
+
+    Raises
+    ------
+    TypeError, ValueError, RuntimeError
+        As for the backward; also an ``out`` of another shape or layout (outputs are never copied).
+
+    Notes
+    -----
+    ``R = 0`` returns empty outputs and launches nothing.
+    """
+
+    return _backend().cake_situ_glu_det_train_backward_recompute(
+        grad_out,
+        gate_up_or_gate,
+        up,
+        beta=beta,
+        lb=lb,
+        out=out,
+        grad_gate_up_or_gate=grad_gate_up_or_gate,
+        grad_up=grad_up,
+    )
+
+
+@cake_api
 def cake_situ_glu_det(
     gate_up_or_gate: torch.Tensor,
     up: Optional[torch.Tensor] = None,
@@ -316,6 +394,7 @@ __all__ = [
     "CakeSiTUGLUDetFunction",  # noqa: F822 - resolved by __getattr__
     "cake_situ_glu_det",
     "cake_situ_glu_det_train_backward",
+    "cake_situ_glu_det_train_backward_recompute",
     "cake_situ_glu_det_train_forward",
     "is_cake_situ_glu_det_train_supported",
 ]

@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backend of :mod:`cake_pplx.cake_situ_glu_det_train`: the Cake SiTU-GLU
-activation of an MLP in training, forward and backward (SM100 / SM103 /
-SM107), as one self-contained package (host API bodies, the ``cake_jit``
-registry, the pinned ``cake_build`` loader and the generated CUDA sources under
-``csrc/``).  The
+activation of an MLP in training, forward, backward and the fused backward of
+a checkpointed step (SM100 / SM103 / SM107), as one self-contained package
+(host API bodies, the ``cake_jit`` registry, the pinned ``cake_build`` loader
+and the generated CUDA sources under ``csrc/``).  The
 ``@cake_api``-decorated entry points and the user-facing documentation live in
 :mod:`cake_pplx.cake_situ_glu_det_train`; import that module.
 
@@ -32,16 +32,18 @@ Host design (every control is an argument; no environment variable):
   that is not 1, a row stride that is not a multiple of 8 elements, a base
   address that is not 16-byte aligned) is copied once to a contiguous tensor.
   ``beta`` and ``lb`` are finite positive Python numbers rounded to FP32
-  (defaults 4.0 and 25.0), with ``2.88539 / beta``, ``2.88539 / lb``,
+  (defaults 4.0 and 25.0), with ``k1 = -2 log2(e) / beta``,
+  ``k2 = -2 log2(e) / lb`` (FP32 divisions by :data:`TWO_LOG2E_F32`),
   ``beta lb``, ``beta (1 + 2^-21)`` and ``lb (1 + 2^-21)`` finite in FP32,
-  the constants the kernels form (``ValueError`` otherwise); they are launch
-  arguments, as are ``R``, ``I`` and the strides, so one build serves every
-  call.  The tests cover ``beta`` in ``[2.5, 4]``
-  and ``lb`` in ``[10, 40]``.
+  the constants the kernels form or take (``ValueError`` otherwise); they are
+  launch arguments, as are ``R``, ``I`` and the strides, so one build serves
+  every call.  The tests cover ``beta`` in ``[2.5, 4]`` and ``lb`` in
+  ``[10, 40]``.
 - Outputs.  ``h`` is a new contiguous BF16 ``[R, I]`` tensor, or the caller's
-  ``out``.  The backward's ``d_gate`` and ``d_up`` have the layout of the
-  inputs: two new contiguous ``[R, I]`` tensors, or one new contiguous
-  ``[R, 2I]`` gradient for a merged input.  A caller's output buffer must
+  ``out``.  The gradients ``d_gate`` and ``d_up`` (of the backward and of the
+  fused backward of a checkpointed step) have the layout of the inputs: two
+  new contiguous ``[R, I]`` tensors, or one new contiguous ``[R, 2I]``
+  gradient for a merged input.  A caller's output buffer must
   already be a layout the kernels write (2-D, a unit last stride, a row stride
   that is a multiple of 8 elements and at least the row width, a 16-byte
   aligned base): it is refused with a ``ValueError`` otherwise, never copied.
@@ -50,11 +52,15 @@ Host design (every control is an argument; no environment variable):
   width, the scalars, the output buffers and the device's architecture) before
   an input is copied or an output allocated, so a refused call copies,
   allocates and launches nothing.
-- Launches.  One kernel per call (``cake_jit.MODULES``, the record of the
-  stage through ``cake_jit.PROGRAM_OF``): CTAs of 128 threads (the record's
-  launch block), one CTA per block of ``cake_jit.ROWS_PER_CTA`` rows on the
-  grid's x axis (``cake_jit.grid``).  In each stage a CTA's four warps take
-  its row's segments of 256 columns in turn.  ``R == 0``
+- Launches.  One kernel per call: the program of the first route of
+  ``cake_jit.ROUTES`` that holds for the stage on the device's architecture,
+  ``R >= min_rows_per_sm * SMs`` and, when the route states a width band,
+  ``lo <= I <= hi`` (:func:`run_module`; the SM count is read once per device).
+  CTAs of 128 threads (the record's launch block), one CTA per block of the
+  record's ``rows_per_cta`` rows on the grid's x axis, at most
+  ``ctas_per_sm * SMs`` CTAs when the route states a cap
+  (``cake_jit.grid``); the CTAs stride over the blocks.  Every program of a
+  stage stores the same bits, so the route changes no output bit.  ``R == 0``
   launches nothing and loads no library.  Every launch is a plain
   stream-ordered launch on the current torch stream of the operands' device
   (a tvm-ffi call whose arguments include PyTorch CUDA tensors runs on that
@@ -102,6 +108,8 @@ Host design (every control is an argument; no environment variable):
   both gradients with ``R^2``.
   ``h``, ``d_gate`` and ``d_up`` are each rounded once to BF16.  Every product
   and FMA rounds to nearest without flushing subnormals; nothing is FP64.
+  ``k1`` and ``k2`` are FP32 divisions rounded to nearest: a program that
+  takes them from the host gets the value the others form on the device.
 - Accuracy: the tests hold ``h``, ``d_gate`` and ``d_up`` to the PyTorch BF16
   naive implementation of the same operation (the formula on the BF16
   tensors, the gradients from PyTorch autograd), each against a float64
@@ -117,6 +125,10 @@ Host design (every control is an argument; no environment variable):
   backward recomputes the activation.
   ``torch.utils.checkpoint(..., use_reentrant=False)`` keeps the same inputs;
   the function adds no saved state of its own and no activation.
+- Checkpointed step: :func:`cake_situ_glu_det_train_backward_recompute`
+  stores ``h`` (the forward's bits) and both gradients (the backward's bits)
+  in one launch, for a caller's own ``torch.autograd.Function`` that keeps
+  only the inputs and needs ``h`` again in its backward.  It is not autograd.
 - Mode: the mode is part of the name (``det``).  Every output is elementwise,
   so every launch gives the same bits for the same inputs on the same
   architecture, whatever the row count, the layout, the stream or a CUDA graph;
@@ -133,8 +145,9 @@ from __future__ import annotations
 import functools
 import math
 import numbers
+import operator
 import struct
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from torch.autograd.function import once_differentiable
@@ -248,21 +261,81 @@ def _entry(name: str, arch: str) -> Any:
     return getattr(load(name, arch), cake_jit.MODULES[name]["ffi_entry"])
 
 
-def run_module(stage: str, values: dict[str, Any], *, rows: int, device_index: int) -> None:
-    """Launch the record of ``stage`` (``cake_jit.PROGRAM_OF``) with its kernel parameters named in ``values`` on the
-    grid of ``rows`` rows, on the current torch stream of device ``device_index``.
+@functools.cache
+def _sm_count(device_index: int) -> int:
+    """The SM count of device ``device_index``, read once per device: a host property query (no stream operation, no
+    device read, no synchronization)."""
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+# One route of a stage on one device: ``(least, lo, hi, cap, name, arguments, rows_per_cta)``.  It holds for a launch
+# of ``rows >= least`` rows of width ``lo <= width <= hi``; its program ``name`` then runs on
+# ``ceil(rows / rows_per_cta)`` CTAs, at most ``cap`` when ``cap`` is not None, with ``arguments(values)`` its kernel
+# parameters in ``run`` order.
+_Plan = tuple[int, int, int, Optional[int], str, Callable[[dict[str, Any]], tuple[Any, ...]], int]
+
+
+@functools.cache
+def _plans(stage: str, device_index: int) -> tuple[_Plan, ...]:
+    """The routes of ``stage`` on device ``device_index`` (``cake_jit.routes`` of its architecture, checked there),
+    with the device's SM count multiplied in, made once per stage and device.  A route without a width band takes
+    every width.  No library is loaded here: a program's library loads at its first launch."""
+    sm_count = _sm_count(device_index)
+    plans = []
+    for entry in cake_jit.routes(stage, device_arch(device_index)):
+        name = entry["program"]
+        lo, hi = entry["width"] if entry["width"] is not None else (0, MAX_WIDTH)
+        cap = None if entry["ctas_per_sm"] is None else entry["ctas_per_sm"] * sm_count
+        least = entry["min_rows_per_sm"] * sm_count
+        per_cta = cake_jit.MODULES[name]["rows_per_cta"]
+        plans.append((least, lo, hi, cap, name, operator.itemgetter(*parameters(name)), per_cta))
+    return tuple(plans)
+
+
+def _arguments(name: str, arguments: Callable[[dict[str, Any]], tuple[Any, ...]], values: dict[str, Any]) -> tuple:
+    """``arguments(values)``: the kernel parameters of record ``name`` in ``run`` order (``ValueError`` naming the
+    first one ``values`` lacks)."""
+    try:
+        return arguments(values)
+    except KeyError:
+        for key in parameters(name):
+            if key not in values:
+                raise ValueError(f"record {name} needs argument {key!r}") from None
+        raise
+
+
+def run_module(stage: str, values: dict[str, Any], *, rows: int, width: int, device_index: int) -> None:
+    """Launch the program of ``stage`` for ``rows >= 1`` rows of width ``width`` on device ``device_index``: the first
+    route of ``cake_jit.ROUTES`` that holds on the device's architecture and SM count (:func:`_plans`; the comparison
+    of two or three integers per route), on ``ceil(rows / rows_per_cta)`` CTAs, capped at the route's
+    ``ctas_per_sm * SMs`` (``cake_jit.grid``), with its kernel parameters named in ``values``.  ``values`` may hold
+    more than a program takes: every launch names ``k1`` and ``k2``, and only the programs whose ``arg_plan`` names
+    them take them.
 
     The first argument of every record is a CUDA tensor of that device: tvm-ffi runs the call on PyTorch's current
-    stream of its device, and the binding makes that device current for the launch."""
-    name = cake_jit.PROGRAM_OF[stage]
-    args = []
-    for key in parameters(name):
-        try:
-            args.append(values[key])
-        except KeyError:
-            raise ValueError(f"record {name} needs argument {key!r}") from None
-    grid = cake_jit.grid(stage, rows)
-    _entry(name, device_arch(device_index))(*args, int(grid[0]), int(grid[1]), int(grid[2]))
+    stream of its device, and the binding makes that device current for the launch.  Nothing here reads device memory
+    or synchronizes, so the route of a call is a function of host integers (``R``, ``I``, the architecture and the SM
+    count) and a CUDA graph replays the programs its capture chose."""
+    if rows < 1:
+        raise ValueError(f"a launch needs at least one row, got {rows}")
+    for least, lo, hi, cap, name, arguments, per_cta in _plans(stage, device_index):
+        if rows >= least and lo <= width <= hi:
+            break
+    grid_x = -(-rows // per_cta)
+    if cap is not None and grid_x > cap:
+        grid_x = cap
+    _entry(name, device_arch(device_index))(*_arguments(name, arguments, values), grid_x, 1, 1)
+
+
+def _launch_program(
+    name: str, values: dict[str, Any], *, rows: int, device_index: int, ctas_per_sm: Optional[int] = None
+) -> None:
+    """Launch the program ``name``, a record delivered for the device's architecture, whatever the routes: on
+    ``cake_jit.grid(name, rows, SMs, ctas_per_sm)``.  A private hook for the tests, which run every program of a stage
+    on the same inputs (an entry point launches through :func:`run_module`)."""
+    grid = cake_jit.grid(name, rows, _sm_count(device_index), ctas_per_sm)
+    arguments = operator.itemgetter(*parameters(name))
+    _entry(name, device_arch(device_index))(*_arguments(name, arguments, values), *grid)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -290,31 +363,40 @@ def _scalar(value: Any, name: str) -> float:
     return rounded
 
 
-def _fp32_finite(value: float) -> bool:
+def _fp32(value: float) -> Optional[float]:
+    """``value`` rounded once to FP32, to nearest even, or None past the FP32 range.  The standard ``"<f"`` format
+    refuses a value past FP32 (``OverflowError``); the native ``"f"`` format would make it infinite without an
+    error."""
     try:
-        struct.pack("<f", value)
+        return struct.unpack("<f", struct.pack("<f", value))[0]
     except OverflowError:
-        return False
-    return True
+        return None
 
 
-def _scalars(beta: Any, lb: Any) -> tuple[float, float]:
-    """``beta`` and ``lb`` rounded to FP32 (:func:`_scalar`), with the constants the kernels form from them,
-    ``2.88539 / beta``, ``2.88539 / lb``, ``beta lb``, ``beta (1 + 2^-21)`` and ``lb (1 + 2^-21)``, finite in FP32:
-    the kernels assume them finite.  Each product of an FP32 value and ``1 + 2^-21`` is exact in float64, so
-    :func:`_fp32_finite` rounds it once, as the kernels do."""
+# 2 log2(e) rounded to FP32, the kernels' constant: ``k1 = -TWO_LOG2E_F32 / beta`` and ``k2 = -TWO_LOG2E_F32 / lb``.
+TWO_LOG2E_F32 = 2.885390043258667
+
+
+def _scalars(beta: Any, lb: Any) -> tuple[float, float, float, float]:
+    """``(beta, lb, k1, k2)``: ``beta`` and ``lb`` rounded to FP32 (:func:`_scalar`), and the FP32 divisions
+    ``k1 = -TWO_LOG2E_F32 / beta`` and ``k2 = -TWO_LOG2E_F32 / lb``, the values the kernels form or take.  The float64
+    quotient of two FP32 values, rounded once to FP32, is their FP32 division (float64 holds more than twice FP32's 24
+    bits plus two).  ``k1``, ``k2``, ``beta lb``, ``beta (1 + 2^-21)`` and ``lb (1 + 2^-21)`` must be finite in FP32:
+    the kernels assume them finite.  A product of two FP32 values, or of one and ``1 + 2^-21``, is exact in float64,
+    so one rounding gives the kernels' value."""
     beta32, lb32 = _scalar(beta, "beta"), _scalar(lb, "lb")
+    k1, k2 = _fp32(-TWO_LOG2E_F32 / beta32), _fp32(-TWO_LOG2E_F32 / lb32)
     constants = (
-        ("2.88539 / beta", 2.88539 / beta32),
-        ("2.88539 / lb", 2.88539 / lb32),
-        ("beta lb", beta32 * lb32),
-        ("beta (1 + 2^-21)", beta32 * (1.0 + 2.0**-21)),
-        ("lb (1 + 2^-21)", lb32 * (1.0 + 2.0**-21)),
+        ("k1 = -2 log2(e) / beta", k1),
+        ("k2 = -2 log2(e) / lb", k2),
+        ("beta lb", _fp32(beta32 * lb32)),
+        ("beta (1 + 2^-21)", _fp32(beta32 * (1.0 + 2.0**-21))),
+        ("lb (1 + 2^-21)", _fp32(lb32 * (1.0 + 2.0**-21))),
     )
     for name, value in constants:
-        if not _fp32_finite(value):
+        if value is None:
             raise ValueError(f"{name} is past the FP32 range (beta {beta32!r}, lb {lb32!r}): the kernels need it")
-    return beta32, lb32
+    return beta32, lb32, k1, k2
 
 
 def _check_tensor(tensor: Any, name: str, dtype: torch.dtype, device: Optional[torch.device]) -> torch.Tensor:
@@ -440,7 +522,7 @@ def cake_situ_glu_det_train_forward(
     """Forward step: ``h = bf16(beta tanh(gate / beta) sigmoid(gate) lb tanh(up / lb))``, one rounding (see the
     module and the facade's documentation)."""
     device, rows, width, _, first, second = _operands(gate_up_or_gate, up)
-    beta32, lb32 = _scalars(beta, lb)
+    beta32, lb32, k1, k2 = _scalars(beta, lb)
     if out is not None:
         out = _check_output(out, "out", rows=rows, cols=width, device=device)
     index = int(device.index)
@@ -460,26 +542,33 @@ def cake_situ_glu_det_train_forward(
         "h_stride": _row_stride(h),
         "beta": beta32,
         "lb": lb32,
+        "k1": k1,
+        "k2": k2,
     }
-    run_module("fwd", values, rows=rows, device_index=index)
+    run_module("fwd", values, rows=rows, width=width, device_index=index)
     return h
 
 
-def cake_situ_glu_det_train_backward(
-    grad_out: torch.Tensor,
-    gate_up_or_gate: torch.Tensor,
-    up: Optional[torch.Tensor] = None,
-    *,
-    beta: float = 4.0,
-    lb: float = 25.0,
-    grad_gate_up_or_gate: Optional[torch.Tensor] = None,
-    grad_up: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Backward step: ``(d_gate_up, None)`` for a merged input, ``(d_gate, d_up)`` for two tensors (see the module
-    and the facade's documentation)."""
+def _backward_step(
+    stage: str,
+    grad_out: Any,
+    gate_up_or_gate: Any,
+    up: Any,
+    beta: Any,
+    lb: Any,
+    grad_gate_up_or_gate: Any,
+    grad_up: Any,
+    out: Any,
+) -> tuple[Optional[torch.Tensor], tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    """``(h, gradients)`` of the ``bwd`` stage (``h`` None) or the ``ckpt`` stage (``h`` the new tensor or ``out``):
+    every argument checked first, then the inputs read in place or copied once, the outputs allocated, and one
+    launch unless ``R = 0``.  ``gradients`` is ``(d_gate_up, None)`` for a merged input, ``(d_gate, d_up)`` for two
+    tensors."""
     device, rows, width, merged, first, second = _operands(gate_up_or_gate, up)
     dh = _bf16_2d(grad_out, "grad_out", rows=rows, cols=width, device=device)
-    beta32, lb32 = _scalars(beta, lb)
+    beta32, lb32, k1, k2 = _scalars(beta, lb)
+    if out is not None:
+        out = _check_output(out, "out", rows=rows, cols=width, device=device)
     if merged:
         if grad_up is not None:
             raise ValueError("grad_up must be None for a merged input: grad_gate_up_or_gate receives both halves")
@@ -498,6 +587,9 @@ def cake_situ_glu_det_train_backward(
     device_arch(index)
     gate, up_view = _halves(first, second, width)
     dh = _read(dh)
+    h = None
+    if stage == "ckpt":
+        h = torch.empty(rows, width, dtype=torch.bfloat16, device=device) if out is None else out
     if merged:
         d_gate_up = grad_gate_up_or_gate
         if d_gate_up is None:
@@ -512,7 +604,7 @@ def cake_situ_glu_det_train_backward(
             d_up = torch.empty(rows, width, dtype=torch.bfloat16, device=device)
         result = (d_gate, d_up)
     if rows == 0:
-        return result
+        return h, result
     values = {
         "gate": gate,
         "up": up_view,
@@ -528,9 +620,48 @@ def cake_situ_glu_det_train_backward(
         "d_up_stride": _row_stride(d_up),
         "beta": beta32,
         "lb": lb32,
+        "k1": k1,
+        "k2": k2,
     }
-    run_module("bwd", values, rows=rows, device_index=index)
+    if h is not None:
+        values["h"] = h
+        values["h_stride"] = _row_stride(h)
+    run_module(stage, values, rows=rows, width=width, device_index=index)
+    return h, result
+
+
+def cake_situ_glu_det_train_backward(
+    grad_out: torch.Tensor,
+    gate_up_or_gate: torch.Tensor,
+    up: Optional[torch.Tensor] = None,
+    *,
+    beta: float = 4.0,
+    lb: float = 25.0,
+    grad_gate_up_or_gate: Optional[torch.Tensor] = None,
+    grad_up: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Backward step: ``(d_gate_up, None)`` for a merged input, ``(d_gate, d_up)`` for two tensors (see the module
+    and the facade's documentation)."""
+    _, result = _backward_step("bwd", grad_out, gate_up_or_gate, up, beta, lb, grad_gate_up_or_gate, grad_up, None)
     return result
+
+
+def cake_situ_glu_det_train_backward_recompute(
+    grad_out: torch.Tensor,
+    gate_up_or_gate: torch.Tensor,
+    up: Optional[torch.Tensor] = None,
+    *,
+    beta: float = 4.0,
+    lb: float = 25.0,
+    out: Optional[torch.Tensor] = None,
+    grad_gate_up_or_gate: Optional[torch.Tensor] = None,
+    grad_up: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Fused backward of a checkpointed step: ``(h, d_gate_up, None)`` for a merged input, ``(h, d_gate, d_up)`` for
+    two tensors, in one launch; ``h`` holds the forward's bits and the gradients the backward's (see the module and
+    the facade's documentation)."""
+    h, grads = _backward_step("ckpt", grad_out, gate_up_or_gate, up, beta, lb, grad_gate_up_or_gate, grad_up, out)
+    return h, grads[0], grads[1]
 
 
 class CakeSiTUGLUDetFunction(torch.autograd.Function):
@@ -545,7 +676,7 @@ class CakeSiTUGLUDetFunction(torch.autograd.Function):
     def forward(ctx, gate_up_or_gate, up, beta, lb):
         h = cake_situ_glu_det_train_forward(gate_up_or_gate, up, beta=beta, lb=lb)
         ctx.save_for_backward(gate_up_or_gate, up)
-        ctx.beta, ctx.lb = _scalars(beta, lb)
+        ctx.beta, ctx.lb = _scalars(beta, lb)[:2]
         return h
 
     @staticmethod
@@ -575,6 +706,7 @@ __all__ = [
     "CakeSiTUGLUDetFunction",
     "cake_situ_glu_det",
     "cake_situ_glu_det_train_backward",
+    "cake_situ_glu_det_train_backward_recompute",
     "cake_situ_glu_det_train_forward",
     "is_cake_situ_glu_det_train_supported",
 ]

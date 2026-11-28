@@ -2049,12 +2049,13 @@ if torch.cuda.get_device_capability() == (10, 7):
 
 ## situ_glu
 
-**Computes.** The SiTU-GLU activation of an MLP for training, at any width `I` that is a positive multiple of 256 (the Kimi-K3.1-Pro widths 3072, 6144 and 33,792 among them). Per row `r < R` and column `c < I`, from the BF16 gate `g` and up `u` and the FP32 scalars `beta` and `lb`:
+**Computes.** The SiTU-GLU activation of an MLP for training, and the fused backward of a checkpointed step, at any width `I` that is a positive multiple of 256 (the Kimi-K3.1-Pro widths 3072, 6144 and 33,792 among them). Per row `r < R` and column `c < I`, from the BF16 gate `g` and up `u` and the FP32 scalars `beta` and `lb`:
 
 - **Forward:** `a = beta * tanh(g / beta) * sigmoid(g)` and `u' = lb * tanh(u / lb)` in FP32, and `h = BF16(a * u')`, the only rounding.
 - **Backward:** with `s = sigmoid(g)`, `tg = tanh(g / beta)` and `tu = tanh(u / lb)`, `d_gate = BF16(dh * u' * ((1 - tg^2) * s + a * (1 - s)))` and `d_up = BF16(dh * a * (1 - tu^2))`, each rounded once.
 - There is no clamp: both factors saturate smoothly, so large `|g|` and `|u|` keep finite values. `g = 0` or `u = 0` gives `h = 0` exactly. The activation is unweighted.
 - The backward stores 0 for `d_up` where `|u| > 43.67 lb` and, at `beta >= 2.4`, for `d_gate` where `|g| > 43.67 beta`: there `E` or `W` flushes below `2^-126`, and the exact values are under `2^-124 |dh| beta` and about `2^-124 |dh| lb`.
+- **Fused backward of a checkpointed step:** `h`, `d_gate` and `d_up` in one launch, from `gate`, `up` and `dh`. `h` has the forward's bits and the gradients the backward's.
 - One kernel per call (PyTorch's NaN fills under deterministic algorithms aside; see Caveats). The backward needs only `gate`, `up` and `dh`; it recomputes the activation.
 - Every exponential is the approximate base-2 exponential of a negative argument, so none overflows: `tanh(|g| / beta) = (1 - E) / (1 + E)` with `E = 2^(-2 |g| log2(e) / beta)`, the sigmoid from `P = 2^(-|g| log2(e))` (`P = E * E` at `beta = 4`) and `1 - tanh^2 = 4 E / (1 + E)^2`, the up likewise. The reciprocal of `(1 + E)(1 + P)(1 + W)` is one per element in the forward and one per pair of elements in the backward. Every product rounds to nearest without flushing subnormals; nothing is FP64.
 - The forward takes `beta (1 - E)` as the smaller of two upper bounds, `|g| (1 + E)` and `beta (1 + 2^-21) - beta E`, without a branch: within about `2^-14.8` of the exact value, relative to it, for every `g`, and 0 for `g = 0`. `lb (1 - W)` takes the same form with `|u|` and `lb`. So `h` keeps its accuracy for tiny gates and ups. The bounds hold in exact arithmetic; in FP32 the result can move by up to a few `2^-24` of the exact value, to either side, within that relative error.
@@ -2066,19 +2067,30 @@ if torch.cuda.get_device_capability() == (10, 7):
 
 - `gate`, `up`: BF16 `[R, I]` each, or one `[R, 2I]` tensor with the gate in columns `[0, I)` and the up in `[I, 2I)` (pass it as the first argument with `up=None`). The kernels read every BF16 tensor through its row stride, so the halves of a merged tensor and row slices of wider tensors are read in place when the row stride is a multiple of 8 elements, the last stride is 1 and the base is 16-byte aligned. Other inputs are copied once.
 - `dh`: BF16 `[R, I]`.
-- `beta`, `lb`: finite positive Python numbers, rounded to FP32, with the defaults 4.0 and 25.0 (Kimi-K3.1-Pro's `activation_situ_beta` and `activation_situ_linear_beta`). `2.88539 / beta`, `2.88539 / lb`, `beta * lb`, `beta * (1 + 2^-21)` and `lb * (1 + 2^-21)` must be finite in FP32 (`ValueError` otherwise). The tests cover `beta` in `[2.5, 4]` and `lb` in `[10, 40]`. They are launch arguments, as are `R`, `I` and the strides: one library per program and architecture serves every call, with no recompilation. Each stage has one program, with one CTA per row.
+- `beta`, `lb`: finite positive Python numbers, rounded to FP32, with the defaults 4.0 and 25.0 (Kimi-K3.1-Pro's `activation_situ_beta` and `activation_situ_linear_beta`). The FP32 quotients `k1 = -2 log2(e) / beta` and `k2 = -2 log2(e) / lb` (`2 log2(e)` rounded to FP32, 2.885390043258667), `beta * lb`, `beta * (1 + 2^-21)` and `lb * (1 + 2^-21)` must be finite in FP32 (`ValueError` otherwise). The host computes `k1` and `k2` exactly as the kernels do; compared with the approximate check of 0.2.1 (`2.88539 / beta` finite), the refused set changes only where `k1` or `k2` meets the top of the FP32 range (`beta` or `lb` near `8.5e-39`). The tests cover `beta` in `[2.5, 4]` and `lb` in `[10, 40]`. They are launch arguments, as are `R`, `I` and the strides: one library per program and architecture serves every call, with no recompilation.
 - `R` is any count from 0 to `2**30`. Every operand is on one CUDA device.
 - Every argument is checked before an input is copied or an output allocated, so a call refused for its arguments copies, allocates and launches nothing.
 
+**Programs.** Each call runs one program of its stage, chosen from the architecture, `R` and `I`: the first route that holds, where a route holds when `R >= rows_per_sm * SMs` (the device's SM count) and, when it has a width band, `lo <= I <= hi`. The CTAs of a capped route stride over the rows. Every program of a stage stores the same bits for every input, so the choice changes no output bit.
+
+| stage | `sm_100a` | `sm_103a` | `sm_107a` |
+|---|---|---|---|
+| forward | one program for every `R` and `I` | one program for every `R` and `I` | `R >= 67 SMs` and `2048 <= I <= 3072`: a row-prefetch program, at most 32 CTAs per SM; else `3072 <= I <= 6144`: at most 16 CTAs per SM; else uncapped |
+| backward | one program for every `R` and `I` | one program for every `R` and `I` | `3072 <= I <= 33792`: `R >= 154 SMs`, a program built for 8 CTAs per SM, at most 96 CTAs per SM; `R >= 19 SMs`, the same program at most 48; else the default program |
+| fused backward | `R >= 83 SMs` and `3072 <= I <= 5120`: two rows per CTA; else one row per CTA | `R >= 80 SMs` and `3072 <= I <= 5120`: two rows per CTA; else one row per CTA | `3072 <= I <= 5120`: at most 32 CTAs per SM; else uncapped |
+
+Caption: the routes by stage and architecture (B200 148 SMs, GB300 152, VR200 212); the backend README lists the program names.
+
 ### `cake_pplx.cake_situ_glu_det_train`
 
-This family has a det module only, with no nondet or KCP module: every output is elementwise, with no reduction to reorder, and rows are independent. Every call gives the same bits for the same inputs on the same architecture, whatever `R`, the layout, the stream or a CUDA graph, and no call alerts under `torch.use_deterministic_algorithms(True)`. Source: [`kernels/situ_glu/cake_pplx/cake_situ_glu_det_train.py`](../kernels/situ_glu/cake_pplx/cake_situ_glu_det_train.py).
+This family has a det module only, with no nondet or KCP module: every output is elementwise, with no reduction to reorder, and rows are independent. Every call gives the same bits for the same inputs on the same architecture, whatever `R`, the program a route picks, the layout, the stream or a CUDA graph, and no call alerts under `torch.use_deterministic_algorithms(True)`. Source: [`kernels/situ_glu/cake_pplx/cake_situ_glu_det_train.py`](../kernels/situ_glu/cake_pplx/cake_situ_glu_det_train.py).
 
 | Name | Signature | Inputs | Returns / notes |
 |---|---|---|---|
 | `cake_situ_glu_det` | `(gate_up_or_gate, up=None, *, beta=4.0, lb=25.0)` | As above | Autograd. Returns contiguous BF16 `h [R, I]`, the down projection's input. A merged input's gradient is one `[R, 2I]` tensor; `beta` and `lb` get none. Saves only its inputs; the backward recomputes the activation. |
 | `cake_situ_glu_det_train_forward` | `(gate_up_or_gate, up=None, *, beta=4.0, lb=25.0, out=None)` | `out` optional preallocated BF16 `[R, I]` (the layout rules above, rows not overlapping) | Returns `h` (`out` when given). Not autograd. `R == 0` returns an empty `h` without a launch. |
 | `cake_situ_glu_det_train_backward` | `(grad_out, gate_up_or_gate, up=None, *, beta=4.0, lb=25.0, grad_gate_up_or_gate=None, grad_up=None)` | `grad_out` BF16 `[R, I]`; optional preallocated outputs: `grad_gate_up_or_gate` (`d_gate [R, I]`, or the merged `[R, 2I]` gradient), `grad_up` (two-tensor form only) | Returns `(d_gate_up, None)` for a merged input or `(d_gate, d_up)`. Not autograd. Unfit output buffers raise `ValueError` (never copied). |
+| `cake_situ_glu_det_train_backward_recompute` | `(grad_out, gate_up_or_gate, up=None, *, beta=4.0, lb=25.0, out=None, grad_gate_up_or_gate=None, grad_up=None)` | As the backward; `out` optional preallocated BF16 `h [R, I]` | The fused backward of a checkpointed step: returns `(h, d_gate_up, None)` for a merged input or `(h, d_gate, d_up)`, in one launch. `h` has the forward's bits and the gradients the backward's. Not autograd. |
 
 Other public names:
 
@@ -2094,7 +2106,6 @@ Other public names:
 
 ```python
 import torch
-import torch.utils.checkpoint
 from cake_pplx.cake_situ_glu_det_train import cake_situ_glu_det
 
 R, I = 16380, 6144
@@ -2102,27 +2113,48 @@ gate_up = torch.randn(R, 2 * I, device="cuda", dtype=torch.bfloat16, requires_gr
 
 h = cake_situ_glu_det(gate_up)  # BF16 [R, 6144]; beta = 4.0, lb = 25.0
 h.backward(torch.randn_like(h))  # gate_up.grad BF16 [R, 12288]
-
-# Activation checkpointing: checkpoint the op together with the down projection.
-w_down = (torch.randn(7168, I, device="cuda") / I**0.5).bfloat16().requires_grad_()  # BF16 [hidden, 6144]
-
-
-def situ_down(gate_up, w_down):
-    return torch.nn.functional.linear(cake_situ_glu_det(gate_up), w_down)
-
-
-y = torch.utils.checkpoint.checkpoint(situ_down, gate_up, w_down, use_reentrant=False)
-y.backward(torch.randn_like(y))  # the backward recomputes h once, for the down projection's weight gradient
 ```
 
-**Caveats.**
+**Checkpointing.** The op keeps only its inputs, so checkpointing it alone saves no memory: the down projection keeps `h` for its weight gradient. To drop `h` between the forward and the backward, keep `gate_up` and `w_down` only and get `h` back from the fused backward:
 
-- Checkpointing: the op keeps only its inputs, so checkpointing it alone saves no memory. The down projection keeps `h` for its weight gradient. Checkpoint the op together with the down projection (as in the example) so that `h` is not kept from the forward to the backward. The backward of a non-reentrant checkpoint then runs the forward kernel once more before the backward kernel: two forwards and one backward per step.
+```python
+import torch
+from cake_pplx.cake_situ_glu_det_train import (
+    cake_situ_glu_det_train_backward_recompute,
+    cake_situ_glu_det_train_forward,
+)
+
+
+class SituDown(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate_up, w_down):
+        h = cake_situ_glu_det_train_forward(gate_up)
+        ctx.save_for_backward(gate_up, w_down)  # h is not kept
+        return torch.nn.functional.linear(h, w_down)
+
+    @staticmethod
+    def backward(ctx, dy):
+        gate_up, w_down = ctx.saved_tensors
+        dy2 = dy.reshape(-1, dy.shape[-1])
+        dh = dy2 @ w_down  # 1. dgrad of down: needs no h
+        h, d_gate_up, _ = cake_situ_glu_det_train_backward_recompute(dh, gate_up)  # 2. h + grads
+        d_w_down = dy2.t() @ h  # 3. wgrad with the recomputed h
+        return d_gate_up, d_w_down
+
+
+w_down = (torch.randn(7168, I, device="cuda") / I**0.5).bfloat16().requires_grad_()  # BF16 [hidden, 6144]
+y = SituDown.apply(gate_up, w_down)
+y.backward(torch.randn_like(y))
+```
+
+Caption: the elementwise work of a checkpointed step drops from two forwards and one backward to one forward and one fused backward. The order in `backward` matters: the down projection's input gradient needs no `h`, so it runs first; the fused call then gives `h` for the weight gradient. `d_gate_up` has the bits of the package's autograd function, and `h` the forward's. `torch.utils.checkpoint(..., use_reentrant=False)` around the op and the down projection still works: it runs the forward kernel once more before the backward kernel (two forwards and one backward).
+
+**Caveats.**
 - Workspace: none. Retained state of the autograd function: its inputs only (references, no copy).
 - Under `torch.use_deterministic_algorithms(True)` with `torch.utils.deterministic.fill_uninitialized_memory` (on by default), PyTorch fills every tensor a call allocates with NaN before the kernel writes it: one more fill launch per new output and per copied input. Output buffers allocated once and passed to every call avoid the fills of those outputs. The bits do not change.
 - No double backward. With `create_graph=True` the op's gradients are constants of the graph: differentiating them raises `RuntimeError` when the upstream gradient requires grad, and adds no term of this op otherwise. No FP8 or FP4 output. Not tested under `torch.compile`.
 - `beta` and `lb` must be Python numbers: a tensor raises `TypeError`, as reading it would synchronize the host.
-- A program's library builds at its first launch. Before capturing a CUDA graph, run one eager call of each stage, or build every library of the architecture (the backend's `specs_for_arch`), so that no JIT build runs inside capture.
+- A program's library builds at its first launch, and the program of a call depends on `R` and `I`. Before capturing a CUDA graph, run one eager call at each `(R, I)` and stage the graph captures, or build every library of the architecture (the backend's `specs_for_arch`), so that no JIT build runs inside capture. The route is a function of host integers (`R`, `I`, the architecture and the SM count): a replay runs the programs the capture chose.
 
 ---
 

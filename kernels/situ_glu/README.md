@@ -2,7 +2,8 @@
 
 Cake `situ_glu` training kernels: the SiTU-GLU activation of an MLP, forward and backward, from BF16 gate and up
 inputs with FP32 math and one BF16 rounding of each output, at any width that is a multiple of 256 (3072, 6144 and
-33,792 among them), on `sm_100a`, `sm_103a` and `sm_107a`. Public module:
+33,792 among them), on `sm_100a`, `sm_103a` and `sm_107a`. `cake_situ_glu_det_train_backward_recompute` is the fused
+backward of a checkpointed step: `h` and both gradients in one launch. Public module:
 
 - `cake_pplx.cake_situ_glu_det_train`
 

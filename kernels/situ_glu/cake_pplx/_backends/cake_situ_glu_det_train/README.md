@@ -1,7 +1,8 @@
 # Deterministic SiTU-GLU training backend (SM100 / SM103 / SM107)
 
-Backend of `cake_pplx.cake_situ_glu_det_train`: the SiTU-GLU activation of an MLP in training, forward and backward,
-at any width `I` that is a positive multiple of 256 (the widths 3072, 6144 and 33,792 among them).  The math is FP32
+Backend of `cake_pplx.cake_situ_glu_det_train`: the SiTU-GLU activation of an MLP in training, forward, backward and
+the fused backward of a checkpointed step, at any width `I` that is a positive multiple of 256 (the widths 3072, 6144
+and 33,792 among them).  The math is FP32
 on the BF16 inputs, with one BF16 rounding of each output.  The activation is unweighted.
 
 The facade `cake_pplx.cake_situ_glu_det_train` is a stable API.  This backend package is experimental, and its internal
@@ -31,10 +32,13 @@ h = torch.utils.checkpoint.checkpoint(cake_situ_glu_det, gate_up, use_reentrant=
 
 The steps without autograd, `cake_situ_glu_det_train_forward` and `cake_situ_glu_det_train_backward`, take the same
 operands and optional preallocated outputs (`out=`, `grad_gate_up_or_gate=`, `grad_up=`), for a caller that fuses the
-activation into its own `torch.autograd.Function`.  `beta` and `lb` are keywords everywhere, with the defaults 4.0
-and 25.0.  They must be positive and finite in FP32, with `2.88539 / beta`, `2.88539 / lb`, `beta lb`,
-`beta (1 + 2^-21)` and `lb (1 + 2^-21)` finite in FP32 (`ValueError` otherwise); the tests cover `beta` in `[2.5, 4]`
-and `lb` in `[10, 40]`.
+activation into its own `torch.autograd.Function`.  `cake_situ_glu_det_train_backward_recompute` is the fused
+backward of a checkpointed step: `(h, d_gate_up, None)` or `(h, d_gate, d_up)` in one launch, `h` with the forward's
+bits and the gradients with the backward's (the API documentation's `SituDown` example keeps only `gate_up` and the
+down projection's weight, and takes `h` back from this call).  `beta` and `lb` are keywords everywhere, with the
+defaults 4.0 and 25.0.  They must be positive and finite in FP32, with the FP32 quotients `k1 = -2 log2(e) / beta`
+and `k2 = -2 log2(e) / lb`, `beta lb`, `beta (1 + 2^-21)` and `lb (1 + 2^-21)` finite in FP32 (`ValueError`
+otherwise); the tests cover `beta` in `[2.5, 4]` and `lb` in `[10, 40]`.
 
 ## Inputs and outputs
 
@@ -45,6 +49,8 @@ and `lb` in `[10, 40]`.
 | `h` | `[R, I]` | BF16 | new and contiguous, or the caller's `out` |
 | `dh` | `[R, I]` | BF16 | upstream gradient |
 | `d_gate`, `d_up` | `[R, I]` each | BF16 | or one `[R, 2I]` gradient for a merged input |
+
+The fused backward takes `gate`, `up` and `dh` and stores `h`, `d_gate` and `d_up`.
 
 - Every operand is on one CUDA device.  `R` is any count from 0 to `2**30`.  `I` is a positive multiple of 256.
 - The kernels read every BF16 tensor through its row stride in elements: a row stride that is a multiple of 8, a unit
@@ -61,17 +67,51 @@ and `lb` in `[10, 40]`.
 
 ## Programs
 
-Two programs, one for `fwd` and one for `bwd` (`cake_jit.MODULES`, keyed by program name; `cake_jit.PROGRAM_OF` maps a
-stage to its program), each delivered for `sm_100a`, `sm_103a` and `sm_107a` and compiled with the exact `-gencode` flag
-of each (`build.json`).  Each is one kernel.  A row is `I / 256` segments of 256 columns, and a warp owns a segment:
-lane `l` loads 8 BF16 values at column `256 s + 8 l`, so each load of a warp is contiguous.  A CTA has 128 threads (four
-warps).  In both stages its four warps own one row and take the row's segments in turn, one segment per warp and
-pass.  Each warp issues the loads of its segments before it computes and stores them; a segment past the row's last one
-reloads the last segment and stores nothing, and a row past the last one stores nothing.  The grid is one CTA per block
-of rows (`cake_jit.ROWS_PER_CTA`, `cake_jit.grid`), and the CTAs stride over the blocks, so any smaller grid would also
-be correct.  Row offsets are 64-bit.  No program uses shared memory, a workspace, a cooperative launch or programmatic
-dependent launch.  The row count, the width, `beta`, `lb` and the strides are launch arguments, so one library per
-program and architecture serves every call.
+Eight programs (`cake_jit.MODULES`, keyed by program name) serve three stages: `fwd`, `bwd` and `ckpt` (the fused
+backward).  Each is compiled with the exact `-gencode` flag of each architecture it is delivered for (`build.json`:
+four libraries on `sm_100a`, four on `sm_103a`, five on `sm_107a`).  Each is one kernel.  A row is `I / 256`
+segments of 256 columns, and a warp owns a segment: lane `l` loads 8 BF16 values at column `256 s + 8 l`, so each load
+of a warp is contiguous.  A CTA has 128 threads (four warps).  Four warps own one row (two warps a row in the
+two-rows-a-CTA program) and take the row's segments in turn.  Each warp issues the loads of its segments before it
+computes and stores them; a segment past the row's last one reloads the last segment and stores nothing, and a row past
+the last one stores nothing.  The CTAs stride over the blocks of rows, so a smaller grid runs every row.  Row offsets
+are 64-bit.  No program uses shared memory, a workspace, a cooperative launch or programmatic dependent launch.  The
+row count, the width, `beta`, `lb` and the strides are launch arguments, so one library per program and architecture
+serves every call.
+
+The programs of a stage differ in their schedule only, and store the same bits for every input:
+
+| program | stage | architectures | schedule |
+|---|---|---|---|
+| `cake_situ_glu_det_train_e5d3075ea15fefbb9d43` | `fwd` | `sm_100a`, `sm_103a` | the host's `k1` and `k2` |
+| `cake_situ_glu_det_train_9b922273e948685fab2d` | `fwd` | `sm_107a` | the 0.2.1 forward |
+| `cake_situ_glu_det_train_599ccd99cf9f7a41dae9` | `fwd` | `sm_107a` | the next row's loads issued before a row's stores |
+| `cake_situ_glu_det_train_8ba54d18b9b06905b89e` | `bwd` | `sm_100a`, `sm_103a` | the host's `k1` and `k2` |
+| `cake_situ_glu_det_train_2ad79222570bbd0c2cef` | `bwd` | `sm_107a` | the 0.2.1 backward |
+| `cake_situ_glu_det_train_1819a1f2c9babb2a7303` | `bwd` | `sm_107a` | the host's `k1` and `k2`, built for 8 CTAs per SM |
+| `cake_situ_glu_det_train_0f6427ea51531187fe83` | `ckpt` | all three | one row per CTA |
+| `cake_situ_glu_det_train_0dff177a39167613b5b1` | `ckpt` | `sm_100a`, `sm_103a` | two warps a row, two rows per CTA |
+
+Caption: the programs; `k1 = -2 log2(e) / beta` and `k2 = -2 log2(e) / lb` are FP32 divisions, the values the other
+programs form on the device.
+
+`cake_jit.ROUTES` picks the program of a call: per stage and architecture, the first route that holds runs.  A route
+holds when `R >= rows_per_sm * SMs` (the device's SM count, read once per device) and, when it states a width band,
+`lo <= I <= hi` (inclusive).  The grid is one CTA per block of the program's `rows_per_cta` rows, capped at
+`ctas_per_sm * SMs` when the route states a cap (`cake_jit.route`, `cake_jit.grid`).
+
+| stage | arch | routes, in order (rows per SM, width band, CTAs per SM) |
+|---|---|---|
+| `fwd` | `sm_100a`, `sm_103a` | `e5d3075e...`, every `R` and `I` |
+| `fwd` | `sm_107a` | `599ccd99...` if `R >= 67 SMs` and `2048 <= I <= 3072`, cap 32; `9b922273...` if `3072 <= I <= 6144`, cap 16; `9b922273...` uncapped |
+| `bwd` | `sm_100a`, `sm_103a` | `8ba54d18...`, every `R` and `I` |
+| `bwd` | `sm_107a` | `1819a1f2...` if `R >= 154 SMs` and `3072 <= I <= 33792`, cap 96; the same if `R >= 19 SMs`, same band, cap 48; `2ad79222...` uncapped |
+| `ckpt` | `sm_100a` | `0dff177a...` if `R >= 83 SMs` and `3072 <= I <= 5120`; `0f6427ea...` |
+| `ckpt` | `sm_103a` | `0dff177a...` if `R >= 80 SMs` and `3072 <= I <= 5120`; `0f6427ea...` |
+| `ckpt` | `sm_107a` | `0f6427ea...` if `3072 <= I <= 5120`, cap 32; `0f6427ea...` uncapped |
+
+Caption: the routes, measured on B200 (148 SMs), GB300 (152) and VR200 (212): a conditional route runs where its
+launch measured faster than the next route's.  The windows are in rows per SM, so they scale with the SM count.
 
 ## Numerics
 
@@ -117,8 +157,8 @@ program and architecture serves every call.
 ## Determinism
 
 Every output is elementwise, so every call gives the same bits for the same inputs on the same architecture, whatever
-the row count, the width's place in a wider tensor, the layout (merged, two tensors, row slices), the stream or a CUDA
-graph replay.  No call alerts under `torch.use_deterministic_algorithms(True)`; with
+the row count, the program a route picks, the width's place in a wider tensor, the layout (merged, two tensors, row
+slices), the stream or a CUDA graph replay.  The fused backward stores the forward's `h` and the backward's gradients.  No call alerts under `torch.use_deterministic_algorithms(True)`; with
 `torch.utils.deterministic.fill_uninitialized_memory` (on by default), PyTorch fills each new output and each copied
 input with NaN before the kernel writes it, one more launch each, and the bits do not change.  No entry point takes a
 `deterministic` keyword.  The family has no non-deterministic module: there is no reduction across columns, rows or
@@ -133,5 +173,6 @@ CTAs to reorder.  It has no KCP module: rows are independent, with no sequence d
 ## Limitations
 
 - No double backward (`create_graph`); not tested under `torch.compile` or `torch.jit.trace`.  No FP8 or FP4 output.
-- The library builds on first use; before capturing a CUDA graph, run one eager call (or build the libraries with
-  `specs_for_arch`).
+- A program's library builds at its first launch, and the program of a call depends on `R` and `I`: before capturing
+  a CUDA graph, run one eager call at each `(R, I)` and stage the graph captures (or build the libraries with
+  `specs_for_arch`).  A replay runs the programs the capture chose.
