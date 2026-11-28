@@ -87,7 +87,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # The forward with the host's k1 and k2: one row a CTA, four warps a row.
     "cake_situ_glu_det_train_e5d3075ea15fefbb9d43": {
         "arches": ["sm_100a", "sm_103a"],
-        "arg_plan": [],
+        "arg_plan": [["buffer", "gate"], ["buffer", "up"], ["buffer", "h"], ["parameter", "rows"], ["parameter", "width"], ["parameter", "gate_stride"], ["parameter", "up_stride"], ["parameter", "h_stride"], ["parameter", "beta"], ["parameter", "lb"], ["parameter", "k1"], ["parameter", "k2"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
         "ffi_entry": "run",
         "kernel_symbol": "kernel_cake_situ_glu_det_train_e5d3075ea15fefbb9d43",
         "launch": {
@@ -122,7 +122,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # The forward that issues the next row's loads before it stores a row: one row a CTA, four warps a row.
     "cake_situ_glu_det_train_599ccd99cf9f7a41dae9": {
         "arches": ["sm_107a"],
-        "arg_plan": [],
+        "arg_plan": [["buffer", "gate"], ["buffer", "up"], ["buffer", "h"], ["parameter", "rows"], ["parameter", "width"], ["parameter", "gate_stride"], ["parameter", "up_stride"], ["parameter", "h_stride"], ["parameter", "beta"], ["parameter", "lb"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
         "ffi_entry": "run",
         "kernel_symbol": "kernel_cake_situ_glu_det_train_599ccd99cf9f7a41dae9",
         "launch": {
@@ -139,7 +139,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # The backward with the host's k1 and k2: one row a CTA, four warps a row.
     "cake_situ_glu_det_train_8ba54d18b9b06905b89e": {
         "arches": ["sm_100a", "sm_103a"],
-        "arg_plan": [],
+        "arg_plan": [["buffer", "gate"], ["buffer", "up"], ["buffer", "dh"], ["buffer", "d_gate"], ["buffer", "d_up"], ["parameter", "rows"], ["parameter", "width"], ["parameter", "gate_stride"], ["parameter", "up_stride"], ["parameter", "dh_stride"], ["parameter", "d_gate_stride"], ["parameter", "d_up_stride"], ["parameter", "beta"], ["parameter", "lb"], ["parameter", "k1"], ["parameter", "k2"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
         "ffi_entry": "run",
         "kernel_symbol": "kernel_cake_situ_glu_det_train_8ba54d18b9b06905b89e",
         "launch": {
@@ -174,7 +174,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # The backward with the host's k1 and k2, built for 8 CTAs an SM: one row a CTA, four warps a row.
     "cake_situ_glu_det_train_1819a1f2c9babb2a7303": {
         "arches": ["sm_107a"],
-        "arg_plan": [],
+        "arg_plan": [["buffer", "gate"], ["buffer", "up"], ["buffer", "dh"], ["buffer", "d_gate"], ["buffer", "d_up"], ["parameter", "rows"], ["parameter", "width"], ["parameter", "gate_stride"], ["parameter", "up_stride"], ["parameter", "dh_stride"], ["parameter", "d_gate_stride"], ["parameter", "d_up_stride"], ["parameter", "beta"], ["parameter", "lb"], ["parameter", "k1"], ["parameter", "k2"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
         "ffi_entry": "run",
         "kernel_symbol": "kernel_cake_situ_glu_det_train_1819a1f2c9babb2a7303",
         "launch": {
@@ -191,7 +191,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # The backward of a checkpointed step: d_gate, d_up and h, one row a CTA, four warps a row.
     "cake_situ_glu_det_train_0f6427ea51531187fe83": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "arg_plan": [],
+        "arg_plan": [["buffer", "gate"], ["buffer", "up"], ["buffer", "dh"], ["buffer", "d_gate"], ["buffer", "d_up"], ["buffer", "h"], ["parameter", "rows"], ["parameter", "width"], ["parameter", "gate_stride"], ["parameter", "up_stride"], ["parameter", "dh_stride"], ["parameter", "d_gate_stride"], ["parameter", "d_up_stride"], ["parameter", "h_stride"], ["parameter", "beta"], ["parameter", "lb"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
         "ffi_entry": "run",
         "kernel_symbol": "kernel_cake_situ_glu_det_train_0f6427ea51531187fe83",
         "launch": {
@@ -208,7 +208,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # The backward of a checkpointed step with two warps a row: two rows a CTA.
     "cake_situ_glu_det_train_0dff177a39167613b5b1": {
         "arches": ["sm_100a", "sm_103a"],
-        "arg_plan": [],
+        "arg_plan": [["buffer", "gate"], ["buffer", "up"], ["buffer", "dh"], ["buffer", "d_gate"], ["buffer", "d_up"], ["buffer", "h"], ["parameter", "rows"], ["parameter", "width"], ["parameter", "gate_stride"], ["parameter", "up_stride"], ["parameter", "dh_stride"], ["parameter", "d_gate_stride"], ["parameter", "d_up_stride"], ["parameter", "h_stride"], ["parameter", "beta"], ["parameter", "lb"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
         "ffi_entry": "run",
         "kernel_symbol": "kernel_cake_situ_glu_det_train_0dff177a39167613b5b1",
         "launch": {
