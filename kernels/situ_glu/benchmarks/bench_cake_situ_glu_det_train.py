@@ -20,8 +20,11 @@ operation, each when it imports.
 Arms (``--arms``; default: every arm; ``cake`` always runs first, since the other arms' outputs are compared with its
 outputs):
 
-* ``cake``: ``cake_situ_glu_det_train_forward`` / ``_backward`` (one kernel each), and the autograd entry
-  ``cake_situ_glu_det`` for the ``ckpt`` stage.
+* ``cake``: ``cake_situ_glu_det_train_forward`` / ``_backward`` (one kernel each), the autograd entry
+  ``cake_situ_glu_det`` for the ``ckpt`` stage, and the fused backward ``cake_situ_glu_det_train_backward_recompute``
+  (one kernel) for the ``recompute`` and ``ckpt_fused`` stages.  A stage whose entry point the installed package lacks
+  prints as unavailable.  Per row, the arm records the program and the grid each Cake call routes to (``n/a`` when the
+  installed package exposes no route).
 * ``cudnn``: cuDNN frontend pointwise graphs of the SiTU activation, op for op as the frontend's gated MLP builds its
   ``situ`` activation and its derivative: ``gate_act = beta tanh(g / beta) sigmoid(g)``, ``up_act = lb tanh(u / lb)``,
   ``h = gate_act up_act``; ``d_gate = dh up_act ((1 - tg^2) s + beta tg s (1 - s))`` and
@@ -53,10 +56,13 @@ graph and plan building happen before timing.  Each arm's outputs are compared w
 difference and the share of elements whose bits differ), and each arm's outputs on the first ``--acc-rows`` rows with a
 float64 oracle (relative L2 error).
 
-Stages: ``fwd`` (one forward), ``bwd`` (one backward from ``gate``, ``up`` and ``dh``; the activation is recomputed),
-and ``ckpt`` (an autograd step under ``torch.utils.checkpoint(..., use_reentrant=False, preserve_rng_state=False)``:
-the forward, then the backward, which recomputes the forward first: two forwards and one backward, the issue's update
-under activation checkpointing).  Every stage runs once untimed before its timers.
+Stages (``--stages``; default: every stage): ``fwd`` (one forward), ``bwd`` (one backward from ``gate``, ``up`` and
+``dh``; the activation is recomputed), ``ckpt`` (an autograd step under ``torch.utils.checkpoint(...,
+use_reentrant=False, preserve_rng_state=False)``: the forward, then the backward, which recomputes the forward first:
+two forwards and one backward, the issue's update under activation checkpointing), and, for the ``cake`` arm only,
+``recompute`` (one fused backward: ``h``, ``d_gate`` and ``d_up`` from ``gate``, ``up`` and ``dh``) and ``ckpt_fused``
+(a checkpointed step with the fused backward: one forward, then one fused backward).  Every stage runs once untimed
+before its timers.
 
 Timers (``--timers``):
 
@@ -69,17 +75,19 @@ Timers (``--timers``):
   warm-up calls.
 
 Bandwidth: each input read once and each output written once, over ``R I`` elements: ``fwd`` 6 bytes per element
-(``gate``, ``up``, ``h``), ``bwd`` 10 (``gate``, ``up``, ``dh``, ``d_gate``, ``d_up``) and ``ckpt`` 22 (two forwards
-and a backward).  ``GB/s`` is these bytes over each timer's time, and ``util`` that over the device's peak DRAM
-bandwidth from NVML (:func:`peak_gbps`: memory clock x bus width x 2 / 8 / 1000, read once per device).  The header
-prints ``CUDA_VISIBLE_DEVICES``, the torch device's UUID and the UUID of the NVML device at the same index (the one
-the peak reads), and whether they match.  The ratio columns are baseline / Cake (above 1: Cake is faster) per timer.
-``--json`` writes everything.
+(``gate``, ``up``, ``h``), ``bwd`` 10 (``gate``, ``up``, ``dh``, ``d_gate``, ``d_up``), ``ckpt`` 22 (two forwards
+and a backward), ``recompute`` 12 (``gate``, ``up``, ``dh``, ``h``, ``d_gate``, ``d_up``) and ``ckpt_fused`` 18 (a
+forward and a fused backward).  ``GB/s`` is these bytes over each timer's time, and ``util`` that over the device's
+peak DRAM bandwidth from NVML (:func:`peak_gbps`: memory clock x bus width x 2 / 8 / 1000, read once per device).
+The header prints ``CUDA_VISIBLE_DEVICES``, the torch device's UUID and the UUID of the NVML device at the same index
+(the one the peak reads), and whether they match.  The ratio columns are baseline / Cake (above 1: Cake is faster)
+per timer.  ``--json`` writes everything.
 
 Example::
 
     python benchmarks/bench_cake_situ_glu_det_train.py --json situ_glu.json
     python benchmarks/bench_cake_situ_glu_det_train.py --points 262144:3072 --layouts merged --arms cake cudnn
+    python benchmarks/bench_cake_situ_glu_det_train.py --arms cake --stages ckpt ckpt_fused
 """
 
 from __future__ import annotations
@@ -101,6 +109,7 @@ from typing import Any, Optional
 import torch
 import torch.utils.checkpoint
 
+import cake_pplx.cake_situ_glu_det_train as cake_facade
 from cake_pplx.cake_situ_glu_det_train import (
     cake_situ_glu_det,
     cake_situ_glu_det_train_backward,
@@ -108,11 +117,24 @@ from cake_pplx.cake_situ_glu_det_train import (
 )
 
 ARMS = ("cake", "cudnn", "torch_compile", "eager")
-STAGES = ("fwd", "bwd", "ckpt")
+STAGES = ("fwd", "bwd", "ckpt", "recompute", "ckpt_fused")
+# The stages only the Cake arm has (the fused backward of a checkpointed step).
+CAKE_ONLY_STAGES = ("recompute", "ckpt_fused")
 TIMERS = ("graph", "cupti")
 POINTS = ("262144:3072", "16380:6144", "16380:33792", "16380:3072", "65536:3072", "1024:3072")
 # DRAM bytes per element of R x I: each input read once, each output written once (BF16).
-BYTES_PER_ELEMENT = {"fwd": 6, "bwd": 10, "ckpt": 22}
+BYTES_PER_ELEMENT = {"fwd": 6, "bwd": 10, "ckpt": 22, "recompute": 12, "ckpt_fused": 18}
+# The package's entry point of the fused backward, or None when the installed package has none.
+RECOMPUTE = getattr(cake_facade, "cake_situ_glu_det_train_backward_recompute", None)
+# The calls of each bench stage of the Cake arm, by the package's stage (its routes): ``ckpt`` runs two forwards and a
+# backward, ``ckpt_fused`` a forward and a fused backward.
+CAKE_CALLS = {
+    "fwd": ("fwd",),
+    "bwd": ("bwd",),
+    "ckpt": ("fwd", "fwd", "bwd"),
+    "recompute": ("ckpt",),
+    "ckpt_fused": ("fwd", "ckpt"),
+}
 # cuDNN plan selection: warm-up replays and timed replays of every candidate plan.
 PLAN_WARMUP, PLAN_ROUNDS = 1, 5
 
@@ -376,13 +398,53 @@ def _version(dist: str) -> Optional[str]:
         return None
 
 
+def _recompute(x: types.SimpleNamespace) -> tuple:
+    if RECOMPUTE is None:
+        raise Unavailable(
+            f"cake-pplx-situ-glu {_version('cake-pplx-situ-glu')} has no cake_situ_glu_det_train_backward_recompute"
+        )
+    return RECOMPUTE(x.dh, x.first, x.second, beta=x.beta, lb=x.lb)
+
+
+def _ckpt_fused(x: types.SimpleNamespace) -> tuple:
+    """A checkpointed step with the fused backward: the forward's ``h`` (the down projection's input), then ``h`` and
+    the gradients from one fused backward."""
+    h = cake_situ_glu_det_train_forward(x.first, x.second, beta=x.beta, lb=x.lb)
+    return h, _recompute(x)
+
+
+def cake_routes(x: types.SimpleNamespace) -> Any:
+    """The program and the grid of each of the package's stages for this row, from the backend registry's
+    ``route``, ``select`` and ``grid``; ``"n/a"`` when the installed package exposes no route."""
+    try:
+        import cake_pplx._backends.cake_situ_glu_det_train.cake_jit as cake_jit  # noqa: PLC0415 - the family's registry
+    except ImportError as exc:
+        return f"n/a ({type(exc).__name__})"
+    if not all(hasattr(cake_jit, name) for name in ("route", "select", "grid")):
+        return "n/a"
+    device = torch.device("cuda", torch.cuda.current_device())
+    arch = cake_jit.ARCH_BY_CAPABILITY.get(tuple(torch.cuda.get_device_capability(device)))
+    sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    if arch is None:
+        return "n/a (not an exported architecture)"
+    found = {}
+    for stage in cake_jit.STAGES:
+        entry = cake_jit.route(stage, arch, sm_count, x.R, x.I)
+        grid = cake_jit.grid(entry["program"], x.R, sm_count, entry["ctas_per_sm"])
+        found[stage] = {"program": entry["program"], "grid": list(grid), "ctas_per_sm": entry["ctas_per_sm"]}
+    return found
+
+
 def cake_arm(x: types.SimpleNamespace) -> dict[str, Any]:
     return {
         "forward": lambda x: cake_situ_glu_det_train_forward(x.first, x.second, beta=x.beta, lb=x.lb),
         "backward": lambda x: cake_situ_glu_det_train_backward(x.dh, x.first, x.second, beta=x.beta, lb=x.lb),
         "autograd": lambda first, second, beta=x.beta, lb=x.lb: cake_situ_glu_det(first, second, beta=beta, lb=lb),
+        "recompute": _recompute,
+        "ckpt_fused": _ckpt_fused,
         "version": f"cake-pplx-situ-glu {_version('cake-pplx-situ-glu')}",
         "workspace_bytes": 0,
+        "notes": {"routes": cake_routes(x)},
     }
 
 
@@ -784,7 +846,10 @@ def make_arm(name: str, x: types.SimpleNamespace, args: argparse.Namespace) -> d
 # Rows
 
 
-def _stage_calls(arm: dict[str, Any], x: types.SimpleNamespace) -> dict[str, Callable[[], object]]:
+def _stage_calls(
+    arm: dict[str, Any], x: types.SimpleNamespace, stages: tuple[str, ...]
+) -> dict[str, Callable[[], object]]:
+    """The call of each of ``stages`` the arm has (the fused-backward stages are the Cake arm's only)."""
     calls: dict[str, Callable[[], object]] = {
         "fwd": lambda: arm["forward"](x),
         "bwd": lambda: arm["backward"](x),
@@ -797,7 +862,10 @@ def _stage_calls(arm: dict[str, Any], x: types.SimpleNamespace) -> dict[str, Cal
         return torch.autograd.grad(h, wants, x.dh)
 
     calls["ckpt"] = ckpt
-    return calls
+    for stage in CAKE_ONLY_STAGES:
+        if stage in arm:
+            calls[stage] = functools.partial(arm[stage], x)
+    return {stage: calls[stage] for stage in stages if stage in calls}
 
 
 def _compare(found: dict[str, torch.Tensor], cake: dict[str, torch.Tensor]) -> dict[str, Any]:
@@ -914,13 +982,19 @@ def bench_row(rows: int, width: int, layout: str, args: argparse.Namespace, peak
         row["rel_l2_vs_fp64"] = _accuracy(outputs, want, acc_rows)
         if name == "cake":
             reference = outputs
+            if "recompute" in args.stages or "ckpt_fused" in args.stages:
+                fused = _first(lambda: _recompute(x), missing, "recompute")
+                if fused is not None:
+                    # the fused backward stores the forward's h and the backward's gradients: no bit differs
+                    row["recompute_vs_steps"] = _compare(_outputs(fused[0], fused[1:]), outputs)
+                del fused
         elif reference is not None:
             row["vs_cake"] = _compare(outputs, reference)
         del h, grads, outputs
         row["stages"] = {}
-        for stage, call in _stage_calls(arm, x).items():
-            needs = ("fwd", "bwd")
-            reasons = [missing[part] for part in needs if part in missing and (stage == "ckpt" or part == stage)]
+        for stage, call in _stage_calls(arm, x, tuple(args.stages)).items():
+            needs = {"fwd": ("fwd",), "bwd": ("bwd",), "ckpt": ("fwd", "bwd"), "ckpt_fused": ("fwd",)}.get(stage, ())
+            reasons = [missing[part] for part in needs if part in missing]
             if reasons:
                 row["stages"][stage] = {"unavailable": "; ".join(reasons)}
                 continue
@@ -980,6 +1054,15 @@ def format_row(result: dict[str, Any], timers: tuple[str, ...]) -> list[str]:
         notes.append(f"- {name} rel-L2 vs FP64 (first rows): {accuracy}")
         if "vs_cake" in row:
             notes.append(f"- {name} outputs vs cake: {json.dumps(row['vs_cake'])}")
+        if "recompute_vs_steps" in row:
+            notes.append(f"- {name} fused backward vs forward and backward: {json.dumps(row['recompute_vs_steps'])}")
+        if "routes" in row:
+            routes = row["routes"]
+            if isinstance(routes, dict):
+                routes = "; ".join(
+                    f"{stage} {entry['program']} grid {tuple(entry['grid'])}" for stage, entry in routes.items()
+                )
+            notes.append(f"- {name} routes: {routes}")
         for key in ("compile", "merged_gradient", "graphs", "scalars", "errors"):
             if row.get(key):
                 notes.append(f"- {name} {key}: {row[key]}")
@@ -1043,6 +1126,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--points", type=_point, nargs="+", default=[_point(p) for p in POINTS], help="R:I pairs")
     parser.add_argument("--layouts", nargs="+", default=["merged", "split"], choices=["merged", "split"])
     parser.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ARMS))
+    parser.add_argument("--stages", nargs="+", default=list(STAGES), choices=list(STAGES))
     parser.add_argument("--timers", nargs="+", default=list(TIMERS), choices=list(TIMERS))
     parser.add_argument("--beta", type=float, default=4.0)
     parser.add_argument("--lb", type=float, default=25.0)
@@ -1079,10 +1163,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"x 2 / 8 / 1000{'' if peak else ' (' + str(ident.get('nvml_peak_error')) + ')'}"
     )
     print(f"# versions: {json.dumps(ident['versions'])}")
+    if RECOMPUTE is None:
+        print("# the installed package has no fused backward: the recompute and ckpt_fused stages are unavailable")
     print(
         "# times in us per call; base/cake above 1: cake is faster; graph = trimmed mean of CUDA-graph replays of "
-        f"{args.calls} calls (warm L2), cupti = median cold-L2 kernel time; GB/s from 6 / 10 / 22 bytes per element "
-        "(fwd / bwd / ckpt); util = GB/s / NVML peak"
+        f"{args.calls} calls (warm L2), cupti = median cold-L2 kernel time; GB/s from 6 / 10 / 22 / 12 / 18 bytes per "
+        "element (fwd / bwd / ckpt / recompute / ckpt_fused); util = GB/s / NVML peak"
     )
     results = []
     for rows, width in args.points:

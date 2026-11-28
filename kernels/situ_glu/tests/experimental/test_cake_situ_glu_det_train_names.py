@@ -18,8 +18,9 @@ Names of the Cake SiTU-GLU training family.
 The family has one mode, ``det``: the facade ``cake_pplx.cake_situ_glu_det_train`` (top level) and its backend
 package ``cake_pplx._backends.cake_situ_glu_det_train``.  Every public name but the module constants
 (``ARCHES``, ``WIDTH_MULTIPLE``, ``SUPPORTED_COMPUTE_CAPABILITIES``) carries ``det`` right after the op: the
-autograd entry ``cake_situ_glu_det``, the steps ``cake_situ_glu_det_train_forward`` / ``_backward``, the
-support query ``is_cake_situ_glu_det_train_supported`` and the autograd class ``CakeSiTUGLUDetFunction``.
+autograd entry ``cake_situ_glu_det``, the steps ``cake_situ_glu_det_train_forward`` / ``_backward``, the fused
+backward of a checkpointed step ``cake_situ_glu_det_train_backward_recompute``, the support query
+``is_cake_situ_glu_det_train_supported`` and the autograd class ``CakeSiTUGLUDetFunction``.
 No entry point has a ``deterministic`` parameter.  The family has no non-deterministic module (every output is
 elementwise) and no former names.  The facade imports its backend package on first use, so
 ``import cake_pplx`` loads no module of it; ``cake_pplx`` is a PEP 420 namespace package (no ``__init__.py``) that
@@ -56,6 +57,7 @@ FACADE_FUNCTIONS = {
     "cake_situ_glu_det",
     f"{MODULE}_forward",
     f"{MODULE}_backward",
+    f"{MODULE}_backward_recompute",
     f"is_{MODULE}_supported",
 }
 CONSTANTS = {"ARCHES", "WIDTH_MULTIPLE", "SUPPORTED_COMPUTE_CAPABILITIES"}

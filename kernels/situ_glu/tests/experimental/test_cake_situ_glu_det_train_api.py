@@ -17,7 +17,8 @@ Tests of the public surface of the Cake SiTU-GLU training kernels (SM100 / SM103
 ``cake_pplx.cake_situ_glu_det_train`` facade.  The facade's entry points are pass-throughs to
 ``cake_pplx._backends.cake_situ_glu_det_train``: the same signatures (``beta`` and ``lb`` keywords with the defaults
 4.0 and 25.0 everywhere) and the same bits as the backend; its autograd class and constants are the backend's
-objects.  The mode rules of the deterministic package: no entry point takes a ``deterministic`` keyword
+objects; the fused backward of a checkpointed step gives the forward's ``h`` and the backward's gradients through
+both.  The mode rules of the deterministic package: no entry point takes a ``deterministic`` keyword
 (``TypeError``, checked without a device), and ``torch.use_deterministic_algorithms(True)`` (strict or ``warn_only``)
 neither raises nor warns in any call.  The facade reads no environment variable.  The numerical contract is
 ``test_cake_situ_glu_det_train.py``'s.
@@ -40,6 +41,7 @@ from cake_pplx.cake_situ_glu_det_train import (
     CakeSiTUGLUDetFunction,
     cake_situ_glu_det,
     cake_situ_glu_det_train_backward,
+    cake_situ_glu_det_train_backward_recompute,
     cake_situ_glu_det_train_forward,
     is_cake_situ_glu_det_train_supported,
 )
@@ -52,9 +54,12 @@ requires_device = pytest.mark.skipif(
 ENTRY_NAMES = (
     "cake_situ_glu_det",
     "cake_situ_glu_det_train_backward",
+    "cake_situ_glu_det_train_backward_recompute",
     "cake_situ_glu_det_train_forward",
     "is_cake_situ_glu_det_train_supported",
 )
+# The entry points that take the scalars.
+SCALAR_ENTRIES = ENTRY_NAMES[:4]
 NAMESPACES = {"facade": facade, "backend": backend}
 
 
@@ -111,6 +116,7 @@ def test_a_mode_keyword_is_a_type_error(mode) -> None:
             "autograd": lambda: module.cake_situ_glu_det(x, deterministic=mode),
             "forward": lambda: module.cake_situ_glu_det_train_forward(x, deterministic=mode),
             "backward": lambda: module.cake_situ_glu_det_train_backward(dh, x, deterministic=mode),
+            "recompute": lambda: module.cake_situ_glu_det_train_backward_recompute(dh, x, deterministic=mode),
             "supported": lambda: module.is_cake_situ_glu_det_train_supported(torch.device("cpu"), deterministic=mode),
         }
         for what, run in runs.items():
@@ -122,7 +128,7 @@ def test_a_mode_keyword_is_a_type_error(mode) -> None:
 
 def test_scalars_are_keywords_with_the_model_defaults_everywhere() -> None:
     for module in NAMESPACES.values():
-        for name in ENTRY_NAMES[:3]:
+        for name in SCALAR_ENTRIES:
             parameters = inspect.signature(getattr(module, name)).parameters
             for scalar, default in (("beta", 4.0), ("lb", 25.0)):
                 parameter = parameters[scalar]
@@ -168,6 +174,11 @@ def test_facade_matches_backend_bits(merged: bool, width: int) -> None:
         want = backend.cake_situ_glu_det_train_backward(dh, first, second, **scalars)
         for a, b in zip(got, want, strict=True):
             assert (a is None and b is None) or torch.equal(a, b)
+        fused = cake_situ_glu_det_train_backward_recompute(dh, first, second, **scalars)
+        want = backend.cake_situ_glu_det_train_backward_recompute(dh, first, second, **scalars)
+        assert torch.equal(fused[0], h)
+        for a, b, c in zip(fused[1:], want[1:], got, strict=True):
+            assert (a is None and b is None and c is None) or (torch.equal(a, b) and torch.equal(a, c))
         leaves = [None if t is None else t.clone().requires_grad_(True) for t in (first, second)]
         out = cake_situ_glu_det(*leaves, **scalars)
         out.backward(dh)
@@ -192,6 +203,7 @@ def test_deterministic_algorithms_neither_raise_nor_warn(warn_only: bool, determ
         for first, second, dh in (merged, split, empty):
             out.append(cake_situ_glu_det_train_forward(first, second))
             out += [t for t in cake_situ_glu_det_train_backward(dh, first, second) if t is not None]
+            out += [t for t in cake_situ_glu_det_train_backward_recompute(dh, first, second) if t is not None]
         assert is_cake_situ_glu_det_train_supported(merged[0].device)
         first, _, dh = merged
         for checkpoint in (False, True):

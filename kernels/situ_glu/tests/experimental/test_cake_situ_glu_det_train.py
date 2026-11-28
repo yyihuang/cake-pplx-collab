@@ -14,13 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backend suite of the Cake deterministic SiTU-GLU training package (``cake_pplx._backends.cake_situ_glu_det_train``,
-the backend of ``cake_pplx.cake_situ_glu_det_train``): ``h = bf16(beta tanh(g / beta) sigmoid(g) lb tanh(u / lb))`` and
-its gradients ``d_gate`` and ``d_up``, at any width that is a multiple of 256, on SM100, SM103 and SM107.
+the backend of ``cake_pplx.cake_situ_glu_det_train``): ``h = bf16(beta tanh(g / beta) sigmoid(g) lb tanh(u / lb))``, its
+gradients ``d_gate`` and ``d_up``, and the fused backward of a checkpointed step (``h`` and both gradients in one
+launch), at any width that is a multiple of 256, on SM100, SM103 and SM107.
 
-Without a device: the registry (one program per stage, every record delivered for the three architectures and for no
-other, the launch facts, the argument plans), the launch grid, the build manifest (every record's library, the
-recorded source digests), the capability map, the ``beta`` and ``lb`` keywords and their defaults, the refusal of CPU
-tensors and no environment read outside the JIT shim.
+Without a device: the registry (the eight programs of the three stages and their architectures, the launch facts, the
+argument plans, the routes: literal copies of the measured ones), the program of a launch at one row below, at and above
+every rows-per-SM edge and at every width-band edge on 148, 152 and 212 SMs (the pure route and the package's
+per-device plan through a fake device), the launch grids with and without a cap, the host's ``k1`` and ``k2`` against
+the FP32 division, the build manifest (every record's library, the recorded source digests), the capability map, the
+``beta`` and ``lb`` keywords and their defaults, the refusal of CPU tensors and no environment read outside the JIT
+shim.
 
 On SM100 / SM103 / SM107, every training output (``h``, ``d_gate`` and ``d_up``) judged against the naive BF16 tier
 (``tests/cake/test_helpers/cake_naive.py``: the error against an FP64 oracle of the same inputs over 32 independent
@@ -29,16 +33,18 @@ draws, in the L2 and the max norm, median and largest, beside the error of the s
 partial passes of the CTA's warps, both sides of a full pass, and the issue's widths), the merged, two-tensor, sliced
 and copied layouts, saturated, deep negative, small and wide values, zero gates and ups, every BF16 gate and scalars
 other than the model's, and tiny gates or ups, one magnitude band a case, down to ``2^-60 beta`` and ``2^-60 lb``.
-The kernels have no row-count boundary: one program per stage, one CTA per block of rows.
-Beside the judge, exact facts of the contract (no tolerance): ``g = 0`` or ``u = 0`` gives ``h = 0`` exactly (and
+Beside the judge, exact facts of the contract (no tolerance): every program of a stage on the device's architecture
+stores the bits of the stage's last route (forced through a private hook, at the route edges, odd row counts, both
+layouts, two values of ``beta``, uncapped and capped grids); the route changes no bit at a row or width edge; the fused
+backward stores the forward's ``h`` and the backward's gradients; ``g = 0`` or ``u = 0`` gives ``h = 0`` exactly (and
 ``d_up = 0`` at ``g = 0``, ``d_gate = 0`` at ``u = 0``); saturated inputs give finite outputs with the oracle's signs
-outside the flushed range; ``R = 0`` returns empty outputs and launches nothing; one library per stage serves every row
-count, width, scalar and layout; the same bits at every call, in every layout, at every row count (a row's outputs do
-not depend on the other rows), at large row counts whose offsets pass 2**31 bytes, on a side stream with no host
-synchronization, in CUDA graph replays and under ``torch.use_deterministic_algorithms``; the autograd function matches
-the steps bit for bit, saves only its inputs, gives the same bits under non-reentrant checkpointing and has no double
-backward; inputs the kernels can read are read in place, others copied once; unfit outputs, operands and scalars are
-refused.
+outside the flushed range; ``R = 0`` returns empty outputs and launches nothing; one library per routed program serves
+every call; the same bits at every call, in every layout, at large row counts whose offsets pass 2**31 bytes, on a
+side stream with no host synchronization at every route, in CUDA graph replays (across route edges) and under
+``torch.use_deterministic_algorithms``; the autograd function matches the steps bit for bit, saves only its inputs,
+gives the same bits under non-reentrant checkpointing and has no double backward; the documentation's checkpointed
+``SituDown`` example saves only its inputs and gives the autograd path's gradient bits; inputs the kernels can read are
+read in place, others copied once; unfit outputs, operands and scalars are refused.
 
 The suite names its package once, through the shared alias helper, and imports nothing else from ``cake_pplx``.
 """
@@ -46,9 +52,13 @@ The suite names its package once, through the shared alias helper, and imports n
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import inspect
+import itertools
 import json
+import math
+import random
 import re
 import subprocess
 import sys
@@ -78,33 +88,89 @@ cake_jit = cake_package("cake_situ_glu_det_train", "cake_jit")
 
 forward = pkg.cake_situ_glu_det_train_forward
 backward = pkg.cake_situ_glu_det_train_backward
+recompute = pkg.cake_situ_glu_det_train_backward_recompute
 situ_glu = pkg.cake_situ_glu_det
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 PACKAGE_IMPORT = cake_jit.PACKAGE
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
-STAGES = ("fwd", "bwd")
-# The kernel parameters of each stage, in launch order (the kernels' signatures).
-PARAMETERS = {
-    "fwd": ("gate", "up", "h", "rows", "width", "gate_stride", "up_stride", "h_stride", "beta", "lb"),
-    "bwd": (
-        "gate",
-        "up",
-        "dh",
-        "d_gate",
-        "d_up",
-        "rows",
-        "width",
-        "gate_stride",
-        "up_stride",
-        "dh_stride",
-        "d_gate_stride",
-        "d_up_stride",
-        "beta",
-        "lb",
-    ),
+STAGES = ("fwd", "bwd", "ckpt")
+# The kernel parameters of each stage's programs, in launch order (the kernels' signatures): a program that takes the
+# host's scalars takes ``k1`` and ``k2`` after ``lb``.
+FWD_PARAMETERS = ("gate", "up", "h", "rows", "width", "gate_stride", "up_stride", "h_stride", "beta", "lb")
+BWD_PARAMETERS = (
+    "gate",
+    "up",
+    "dh",
+    "d_gate",
+    "d_up",
+    "rows",
+    "width",
+    "gate_stride",
+    "up_stride",
+    "dh_stride",
+    "d_gate_stride",
+    "d_up_stride",
+    "beta",
+    "lb",
+)
+CKPT_PARAMETERS = (*BWD_PARAMETERS[:5], "h", *BWD_PARAMETERS[5:12], "h_stride", "beta", "lb")
+HOST_SCALARS = ("k1", "k2")
+
+# The programs (literal copies of the shipped build identities: a retuned program has another name, and this table
+# changes with the registry): stage, architectures, rows a CTA owns, and whether it takes the host's k1 and k2.
+FWD_HS = "cake_situ_glu_det_train_e5d3075ea15fefbb9d43"  # host scalars
+FWD = "cake_situ_glu_det_train_9b922273e948685fab2d"  # the 0.2.1 forward
+FWD_RP = "cake_situ_glu_det_train_599ccd99cf9f7a41dae9"  # the next row's loads before a row's stores
+BWD_HS = "cake_situ_glu_det_train_8ba54d18b9b06905b89e"  # host scalars
+BWD = "cake_situ_glu_det_train_2ad79222570bbd0c2cef"  # the 0.2.1 backward
+BWD_MB8_HS = "cake_situ_glu_det_train_1819a1f2c9babb2a7303"  # host scalars, built for 8 CTAs an SM
+CKPT_H = "cake_situ_glu_det_train_0f6427ea51531187fe83"  # the backward that also stores h
+CKPT_H_W2 = "cake_situ_glu_det_train_0dff177a39167613b5b1"  # the same with two warps a row
+PROGRAMS = {
+    FWD_HS: ("fwd", ("sm_100a", "sm_103a"), 1, True),
+    FWD: ("fwd", ("sm_107a",), 1, False),
+    FWD_RP: ("fwd", ("sm_107a",), 1, False),
+    BWD_HS: ("bwd", ("sm_100a", "sm_103a"), 1, True),
+    BWD: ("bwd", ("sm_107a",), 1, False),
+    BWD_MB8_HS: ("bwd", ("sm_107a",), 1, True),
+    CKPT_H: ("ckpt", ("sm_100a", "sm_103a", "sm_107a"), 1, False),
+    CKPT_H_W2: ("ckpt", ("sm_100a", "sm_103a"), 2, False),
 }
+# The SM counts of the delivered GPUs: B200, GB300 and VR200.
+SM_COUNTS = (148, 152, 212)
+# The issue's (R, I) points, the benchmark's.
+OWNER_SHAPES = ((262144, 3072), (16380, 6144), (16380, 33792), (16380, 3072), (65536, 3072), (1024, 3072))
+
+
+def expected_route(stage: str, arch: str, sm_count: int, rows: int, width: int) -> tuple[str, int | None]:
+    """``(program, ctas_per_sm)`` of a launch: the measured routes, spelled out (the first that holds)."""
+    if stage == "fwd":
+        if arch != "sm_107a":
+            return FWD_HS, None
+        if rows >= 67 * sm_count and 2048 <= width <= 3072:
+            return FWD_RP, 32
+        if 3072 <= width <= 6144:
+            return FWD, 16
+        return FWD, None
+    if stage == "bwd":
+        if arch != "sm_107a":
+            return BWD_HS, None
+        if rows >= 154 * sm_count and 3072 <= width <= 33792:
+            return BWD_MB8_HS, 96
+        if rows >= 19 * sm_count and 3072 <= width <= 33792:
+            return BWD_MB8_HS, 48
+        return BWD, None
+    least = {"sm_100a": 83, "sm_103a": 80}.get(arch)
+    if least is not None:
+        return (CKPT_H_W2, None) if rows >= least * sm_count and 3072 <= width <= 5120 else (CKPT_H, None)
+    return (CKPT_H, 32) if 3072 <= width <= 5120 else (CKPT_H, None)
+
+
+# The rows-per-SM thresholds and the width-band edges of every route (each tried on every architecture and SM count).
+ROWS_PER_SM_EDGES = (19, 67, 80, 83, 154)
+WIDTH_EDGES = (2048, 3072, 5120, 6144, 33792)
 BUFFERS = {"gate", "up", "h", "dh", "d_gate", "d_up"}
 # The threads of a CTA of each stage's program.
 THREADS = 128
@@ -188,16 +254,115 @@ def _manifest_or_skip() -> dict:
 
 @pytest.fixture
 def launches(monkeypatch: pytest.MonkeyPatch) -> list:
-    """``(stage, rows, values)`` of every launch, in order."""
+    """``(stage, rows, width, values)`` of every launch, in order."""
     launched: list = []
     run_module = pkg.run_module
 
-    def spy(stage, values, *, rows, device_index):
-        launched.append((stage, rows, dict(values)))
-        return run_module(stage, values, rows=rows, device_index=device_index)
+    def spy(stage, values, *, rows, width, device_index):
+        launched.append((stage, rows, width, dict(values)))
+        return run_module(stage, values, rows=rows, width=width, device_index=device_index)
 
     monkeypatch.setattr(pkg, "run_module", spy)
     return launched
+
+
+@pytest.fixture
+def host_device(monkeypatch: pytest.MonkeyPatch):
+    """With no GPU: ``place(arch, sm_count)`` makes every device an ``arch`` device of ``sm_count`` SMs (the
+    architecture and the SM count the routes read), and each launch is recorded in ``calls`` as ``(name, arch, args)``
+    instead of loading a library.  ``properties`` counts the SM-count queries.  The per-device caches are cleared at
+    each placement and after the test."""
+    calls: list = []
+    properties: list = []
+
+    def clear() -> None:
+        pkg._plans.cache_clear()
+        pkg._sm_count.cache_clear()
+
+    def place(arch: str, sm_count: int) -> None:
+        def query(index):
+            properties.append(index)
+            return types.SimpleNamespace(multi_processor_count=sm_count)
+
+        monkeypatch.setattr(pkg, "device_arch", lambda index: arch)
+        monkeypatch.setattr(torch.cuda, "get_device_properties", query)
+        properties.clear()
+        clear()
+
+    monkeypatch.setattr(pkg, "_entry", lambda name, arch: lambda *args: calls.append((name, arch, args)))
+    clear()
+    yield types.SimpleNamespace(place=place, calls=calls, properties=properties)
+    clear()
+
+
+def _programs_of(stage: str, arch: str) -> list[str]:
+    """The programs of ``stage`` delivered for ``arch``, in registry order."""
+    return [name for name, record in cake_jit.MODULES.items() if record["stage"] == stage and arch in record["arches"]]
+
+
+def _device_facts(device: torch.device) -> tuple[str, int]:
+    """``(arch, sm_count)`` of ``device``."""
+    return pkg.device_arch(device.index), int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+def _stage_outputs(stage: str, t: types.SimpleNamespace) -> dict:
+    """The outputs of one call of ``stage`` on ``t``: ``h`` (``fwd``), the gradients (``bwd``) or both (``ckpt``, the
+    fused backward), the gradients keyed as :func:`_functional` keys them."""
+    found = {}
+    if stage == "fwd":
+        found["h"] = forward(t.first, t.second, beta=t.beta, lb=t.lb)
+        return found
+    if stage == "bwd":
+        d_first, d_up = backward(t.dh, t.first, t.second, beta=t.beta, lb=t.lb)
+    else:
+        found["h"], d_first, d_up = recompute(t.dh, t.first, t.second, beta=t.beta, lb=t.lb)
+    found["d_first"] = d_first
+    if d_up is not None:
+        found["d_up"] = d_up
+    return found
+
+
+@contextlib.contextmanager
+def _forced(monkeypatch: pytest.MonkeyPatch, name: str, ctas_per_sm=None):
+    """Within the block, every launch of the stage of program ``name`` runs ``name`` on its grid capped at
+    ``ctas_per_sm`` CTAs an SM (``pkg._launch_program``), whatever the route."""
+    stage = cake_jit.MODULES[name]["stage"]
+    run_module = pkg.run_module
+
+    def run(launched, values, *, rows, width, device_index):
+        assert launched == stage, (launched, name)
+        pkg._launch_program(name, values, rows=rows, device_index=device_index, ctas_per_sm=ctas_per_sm)
+
+    monkeypatch.setattr(pkg, "run_module", run)
+    try:
+        yield
+    finally:
+        monkeypatch.setattr(pkg, "run_module", run_module)
+
+
+def _route_edges(stage: str, arch: str, sm_count: int) -> list[tuple[int, int]]:
+    """``(rows, width)`` of each rows-per-SM edge of ``stage`` on ``arch``: the first row count a route with a row
+    threshold holds at, with a width in its band."""
+    edges = []
+    for entry in cake_jit.ROUTES[stage][arch]:
+        if entry["min_rows_per_sm"] > 0:
+            width = entry["width"][0] if entry["width"] is not None else 3072
+            edges.append((entry["min_rows_per_sm"] * sm_count, width))
+    return edges
+
+
+def _width_edges(stage: str, arch: str, sm_count: int) -> list[tuple[int, int, int]]:
+    """``(rows, inside, outside)`` of each width-band edge of ``stage`` on ``arch``: a row count at which the banded
+    route's row threshold holds, the band's edge width and the width one segment past it."""
+    edges = []
+    for entry in cake_jit.ROUTES[stage][arch]:
+        if entry["width"] is not None:
+            rows = max(129, entry["min_rows_per_sm"] * sm_count + 1)
+            lo, hi = entry["width"]
+            if lo > cake_jit.SEGMENT:
+                edges.append((rows, lo, lo - cake_jit.SEGMENT))
+            edges.append((rows, hi, hi + cake_jit.SEGMENT))
+    return edges
 
 
 def assert_same_bits(got: torch.Tensor, want: torch.Tensor, what: str) -> None:
@@ -280,15 +445,26 @@ def test_registry_records_are_well_formed() -> None:
     assert dict(cake_jit.ARCH_BY_CAPABILITY) == ARCH_BY_CAPABILITY
     assert cake_jit.SEGMENT == 256
     assert cake_jit.PACKAGE == "cake_pplx._backends.cake_situ_glu_det_train"
-    # One record per stage, keyed by its program name (its library); the host reaches it through PROGRAM_OF.
-    assert sorted(record["stage"] for record in cake_jit.MODULES.values()) == sorted(STAGES)
-    assert dict(cake_jit.PROGRAM_OF) == {record["stage"]: name for name, record in cake_jit.MODULES.items()}
+    # The eight programs, keyed by program name (their library): stage, architectures (in ARCHES order), rows a CTA.
+    assert set(cake_jit.MODULES) == set(PROGRAMS)
     prefix = cake_jit.LIBRARY_PREFIX + "_"
     for name, record in cake_jit.MODULES.items():
-        assert set(record) == {"arches", "arg_plan", "ffi_entry", "kernel_symbol", "launch", "library", "stage"}, name
+        stage, arches, rows_per_cta, _ = PROGRAMS[name]
+        assert set(record) == {
+            "arches",
+            "arg_plan",
+            "ffi_entry",
+            "kernel_symbol",
+            "launch",
+            "library",
+            "rows_per_cta",
+            "stage",
+        }, name
         assert record["library"] == name
         assert re.fullmatch(re.escape(prefix) + "[0-9a-f]{20}", name), name
-        assert tuple(record["arches"]) == ARCHES, (name, record["arches"])
+        assert record["stage"] == stage, name
+        assert tuple(record["arches"]) == arches, (name, record["arches"])
+        assert type(record["rows_per_cta"]) is int and record["rows_per_cta"] == rows_per_cta, name
         assert record["ffi_entry"] == "run", name
         assert record["kernel_symbol"] == "kernel_" + record["library"], name
         launch = record["launch"]
@@ -300,11 +476,124 @@ def test_registry_records_are_well_formed() -> None:
     assert cake_jit.VECTOR_ELEMENTS == 8 and cake_jit.ALIGNMENT_BYTES == 16
 
 
+def test_routes_are_well_formed_and_reach_every_program() -> None:
+    """Every stage routes on every architecture: each route states exactly the four fields, names a program of its
+    stage delivered for that architecture, and only the last route of a (stage, architecture) holds at every row count
+    and width (``cake_jit.routes`` checks them).  Every program runs in some route on each architecture it is
+    delivered for (no dead library), and the program of each stage's last route is the one a launch of one row at the
+    smallest width runs."""
+    assert set(cake_jit.ROUTES) == set(STAGES)
+    reached = set()
+    for stage in STAGES:
+        assert set(cake_jit.ROUTES[stage]) == set(ARCHES), stage
+        for arch in ARCHES:
+            table = cake_jit.routes(stage, arch)
+            assert table is cake_jit.ROUTES[stage][arch]
+            for entry in table:
+                assert tuple(entry) == cake_jit.ROUTE_FIELDS == ("program", "min_rows_per_sm", "width", "ctas_per_sm")
+                reached.add((entry["program"], arch))
+            assert table[-1]["min_rows_per_sm"] == 0 and table[-1]["width"] is None, (stage, arch)
+            for sm_count in SM_COUNTS:
+                assert cake_jit.select(stage, arch, sm_count, 1, 256) == table[-1]["program"], (stage, arch)
+    assert reached == {(name, arch) for name, record in cake_jit.MODULES.items() for arch in record["arches"]}
+    for stage, arch in (("gate", "sm_100a"), ("fwd", "sm_90a")):
+        with pytest.raises(ValueError):
+            cake_jit.routes(stage, arch)
+
+
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        ({"program": FWD_HS, "min_rows_per_sm": 0, "width": None}, "exactly"),
+        ({"program": BWD_HS, "min_rows_per_sm": 0, "width": None, "ctas_per_sm": None}, "record"),
+        ({"program": FWD, "min_rows_per_sm": 0, "width": None, "ctas_per_sm": None}, "record"),
+        ({"program": FWD_HS, "min_rows_per_sm": -1, "width": [3072, 6144], "ctas_per_sm": None}, "min_rows_per_sm"),
+        ({"program": FWD_HS, "min_rows_per_sm": True, "width": [3072, 6144], "ctas_per_sm": None}, "min_rows_per_sm"),
+        ({"program": FWD_HS, "min_rows_per_sm": 4, "width": [6144, 3072], "ctas_per_sm": None}, "band"),
+        ({"program": FWD_HS, "min_rows_per_sm": 4, "width": [3072], "ctas_per_sm": None}, "band"),
+        ({"program": FWD_HS, "min_rows_per_sm": 4, "width": None, "ctas_per_sm": 0}, "ctas_per_sm"),
+        ({"program": FWD_HS, "min_rows_per_sm": 0, "width": None, "ctas_per_sm": None}, "only the last"),
+    ],
+    ids=["fields", "stage", "arch", "negative", "bool", "reversed", "short", "cap", "early-unconditional"],
+)
+def test_the_routes_refuse_a_malformed_route(row, message, monkeypatch) -> None:
+    """A route placed before the last route of ``fwd`` on ``sm_100a`` that states other fields, names a program of
+    another stage or architecture, or has a bad bound, band or cap (or holds everywhere) is a ``RuntimeError``."""
+    table = {stage: dict(arches) for stage, arches in cake_jit.ROUTES.items()}
+    table["fwd"]["sm_100a"] = [row, *cake_jit.ROUTES["fwd"]["sm_100a"]]
+    monkeypatch.setattr(cake_jit, "ROUTES", table)
+    with pytest.raises(RuntimeError, match=message):
+        cake_jit.routes("fwd", "sm_100a")
+
+
+def _boundary_rows(sm_count: int) -> list[int]:
+    rows = {1, 2, 3, 129, 4097, cake_jit.MAX_ROWS}
+    rows |= {r for r, _ in OWNER_SHAPES}
+    for least in ROWS_PER_SM_EDGES:
+        rows |= {least * sm_count - 1, least * sm_count, least * sm_count + 1}
+    return sorted(rows)
+
+
+def _boundary_widths() -> list[int]:
+    widths = {256, 1024, 33792 + 256, cake_jit.MAX_WIDTH} | {w for _, w in OWNER_SHAPES}
+    for edge in WIDTH_EDGES:
+        widths |= {edge - cake_jit.SEGMENT, edge, edge + cake_jit.SEGMENT}
+    return sorted(widths)
+
+
+@pytest.mark.parametrize("sm_count", SM_COUNTS)
+@pytest.mark.parametrize("arch", ARCHES)
+@pytest.mark.parametrize("stage", STAGES)
+def test_routes_at_the_boundaries(stage, arch, sm_count) -> None:
+    """``cake_jit.route`` / ``select`` at one row below, at and above every rows-per-SM threshold, at every width-band
+    edge and one segment on either side, and at the issue's shapes give the measured program and cap
+    (:func:`expected_route`), on each architecture with 148, 152 and 212 SMs."""
+    seen = set()
+    for rows, width in itertools.product(_boundary_rows(sm_count), _boundary_widths()):
+        want = expected_route(stage, arch, sm_count, rows, width)
+        entry = cake_jit.route(stage, arch, sm_count, rows, width)
+        assert (entry["program"], entry["ctas_per_sm"]) == want, (rows, width)
+        assert cake_jit.select(stage, arch, sm_count, rows, width) == want[0]
+        seen.add(want)
+    assert seen == {(e["program"], e["ctas_per_sm"]) for e in cake_jit.ROUTES[stage][arch]}
+
+
+@pytest.mark.parametrize("sm_count", SM_COUNTS)
+@pytest.mark.parametrize("arch", ARCHES)
+@pytest.mark.parametrize("stage", STAGES)
+def test_the_package_launches_the_routed_program_on_its_grid(stage, arch, sm_count, host_device) -> None:
+    """Through a fake device of ``arch`` with ``sm_count`` SMs: ``run_module`` runs the measured program (with its
+    parameters, ``k1`` and ``k2`` only where its argument plan names them) on ``ceil(R / rows_per_cta)`` CTAs, capped at
+    ``ctas_per_sm * SMs``, at every boundary shape; the SM count is read once per device."""
+    host_device.place(arch, sm_count)
+    names = set(CKPT_PARAMETERS) | set(FWD_PARAMETERS) | set(HOST_SCALARS)
+    values = {key: f"<{key}>" for key in names}
+    widths = [w for w in _boundary_widths() if w <= 2 * 33792]
+    for rows, width in itertools.product(_boundary_rows(sm_count), widths):
+        name, cap = expected_route(stage, arch, sm_count, rows, width)
+        per = PROGRAMS[name][2]
+        grid_x = -(-rows // per) if cap is None else min(-(-rows // per), cap * sm_count)
+        host_device.calls.clear()
+        pkg.run_module(stage, values, rows=rows, width=width, device_index=0)
+        want = (*(values[key] for key in pkg.parameters(name)), grid_x, 1, 1)
+        assert host_device.calls == [(name, arch, want)], (rows, width)
+        assert cake_jit.grid(name, rows, sm_count, cap) == (grid_x, 1, 1)
+    assert host_device.properties == [0]
+    with pytest.raises(ValueError, match="needs argument"):
+        pkg.run_module(stage, {"gate": None}, rows=1, width=256, device_index=0)
+    with pytest.raises(ValueError, match="row"):
+        pkg.run_module(stage, values, rows=0, width=256, device_index=0)
+
+
 def test_argument_plans_are_the_kernel_parameters() -> None:
     """Each record takes its kernel's parameters in order (tensors as buffers, scalars as parameters), then the
-    grid; the host names every one of them."""
+    grid; the host names every one of them.  ``k1`` and ``k2`` follow ``lb`` exactly in the programs that take the
+    host's scalars; the ``ckpt`` programs take ``h`` after ``d_up`` and ``h_stride`` after ``d_up_stride``."""
+    base = {"fwd": FWD_PARAMETERS, "bwd": BWD_PARAMETERS, "ckpt": CKPT_PARAMETERS}
     for name, record in cake_jit.MODULES.items():
-        assert pkg.parameters(name) == PARAMETERS[record["stage"]], name
+        stage, _, _, host_scalars = PROGRAMS[name]
+        want = base[stage] + (HOST_SCALARS if host_scalars else ())
+        assert pkg.parameters(name) == want, name
         for kind, key in record["arg_plan"]:
             if kind == "grid":
                 continue
@@ -312,26 +601,77 @@ def test_argument_plans_are_the_kernel_parameters() -> None:
         assert [key for kind, key in record["arg_plan"] if kind == "grid"] == ["grid_x", "grid_y", "grid_z"]
 
 
-def test_grid_is_one_cta_per_block() -> None:
-    """One CTA per block of rows on the x axis; at the largest row count a CTA's step over the rows stays in 32
-    bits."""
-    assert cake_jit.ROWS_PER_CTA == {"fwd": 1, "bwd": 1}
-    for stage in STAGES:
-        per = cake_jit.ROWS_PER_CTA[stage]
-        for rows in (1, 2, 3, 129, 4097, 16380, 262144, 1048576, cake_jit.MAX_ROWS):
-            assert tuple(cake_jit.grid(stage, rows)) == (-(-rows // per), 1, 1), (stage, rows)
-        assert cake_jit.MAX_ROWS - 1 + per * cake_jit.grid(stage, cake_jit.MAX_ROWS)[0] <= 2**31 - 1
+def test_grids_are_one_cta_per_block_capped_per_sm() -> None:
+    """One CTA per block of ``rows_per_cta`` rows on the x axis (``ceil(R / 2)`` for two rows a CTA, odd ``R``
+    included), at most ``ctas_per_sm * SMs`` CTAs with a cap (one below, at and one above it); at the largest row
+    count a CTA's first row plus its step over the rows stays in 32 bits."""
+    for name, record in cake_jit.MODULES.items():
+        per = record["rows_per_cta"]
+        for sm_count in SM_COUNTS:
+            for rows in (1, 2, 3, 129, 4097, 16380, 16381, 262144, 1048575, cake_jit.MAX_ROWS):
+                assert cake_jit.grid(name, rows, sm_count) == (-(-rows // per), 1, 1), (name, rows)
+            for cap in (1, 16, 32, 48, 96):
+                full = cap * sm_count * per
+                for rows in (1, full - per - 1, full - 1, full, full + 1, full + per + 1, cake_jit.MAX_ROWS):
+                    want = min(-(-rows // per), cap * sm_count)
+                    assert cake_jit.grid(name, rows, sm_count, cap) == (want, 1, 1), (name, rows, cap)
+        x = cake_jit.grid(name, cake_jit.MAX_ROWS, max(SM_COUNTS))[0]
+        assert per * (x - 1) + per * x <= 2**31 - 1, name
         for rows in (0, -1, cake_jit.MAX_ROWS + 1):
             with pytest.raises(ValueError):
-                cake_jit.grid(stage, rows)
-    with pytest.raises(ValueError):
-        cake_jit.grid("ckpt", 1)
+                cake_jit.grid(name, rows, 148)
+    assert cake_jit.grid(CKPT_H_W2, 1, 148) == (1, 1, 1)
+    assert cake_jit.grid(CKPT_H_W2, 12285, 148) == (6143, 1, 1)
+    assert cake_jit.grid(BWD_MB8_HS, 96 * 212 + 1, 212, 96) == (96 * 212, 1, 1)
+    assert cake_jit.grid(FWD, 16 * 212 - 1, 212, 16) == (16 * 212 - 1, 1, 1)
 
 
-def test_no_record_is_delivered_outside_the_architectures() -> None:
+def test_host_scalars_are_the_fp32_division() -> None:
+    """``k1`` and ``k2`` of the package are ``np.float32(-2 log2(e)) / np.float32(beta)`` and the same of ``lb`` (FP32
+    divisions, round to nearest) for random ``beta`` and ``lb`` over the FP32 range, the model's 4 and 25 and the
+    edges where a constant leaves FP32; a pair whose constants (``k1``, ``k2``, ``beta lb``, ``beta (1 + 2^-21)``,
+    ``lb (1 + 2^-21)``) are not all finite in FP32 is refused.  ``TWO_LOG2E_F32`` is ``2 log2(e)`` rounded to FP32."""
+    np = pytest.importorskip("numpy")
+    two = pkg.TWO_LOG2E_F32
+    assert float(np.float32(two)) == two
+    assert two == float(np.float32(2.0 / math.log(2.0)))
+    rng = random.Random(7)
+    values = [4.0, 25.0, 2.5, 10.0, 40.0, 3.0, 1.0, 0.5, 7.3, 1e-38, 1e-39, 1e-44, 1e38, 3.4e38]
+    values += [rng.uniform(0.1, 100.0) for _ in range(40)]
+    values += [math.ldexp(rng.uniform(1.0, 2.0), e) for e in range(-149, 128, 3)]
+    # beta where -2 log2(e) / beta leaves FP32 (a subnormal beta near 8.48e-39), and where beta (1 + 2^-21) does.
+    edge = two / 3.4028234663852886e38
+    values += [edge * (1.0 + d) for d in (-1e-3, -1e-6, 0.0, 1e-6, 1e-3)]
+    values += [3.4028234663852886e38 / (1.0 + d) for d in (2.0**-22, 2.0**-21, 2.0**-20)]
+    c = np.float32(1.0 + 2.0**-21)
+    checked = refused = 0
+    for beta in values:
+        for lb in (25.0, 1.0, rng.choice(values)):
+            b, lv = np.float32(beta), np.float32(lb)
+            with np.errstate(over="ignore", under="ignore", divide="ignore", invalid="ignore"):
+                k1, k2 = np.float32(-two) / b, np.float32(-two) / lv
+                constants = (k1, k2, b * lv, b * c, lv * c)
+            ok = b > 0 and lv > 0 and np.isfinite(b) and np.isfinite(lv) and all(np.isfinite(x) for x in constants)
+            if ok:
+                assert pkg._scalars(beta, lb) == (float(b), float(lv), float(k1), float(k2)), (beta, lb)
+                checked += 1
+            else:
+                with pytest.raises(ValueError):
+                    pkg._scalars(beta, lb)
+                refused += 1
+    assert checked > 100 and refused > 5, (checked, refused)
+    model = (float(np.float32(-two) / np.float32(4.0)), float(np.float32(-two) / np.float32(25.0)))
+    assert pkg._scalars(4.0, 25.0)[2:] == model
+
+
+def test_no_record_is_delivered_outside_its_architectures() -> None:
     for name, record in cake_jit.MODULES.items():
         for arch in ARCHES:
-            assert pkg.library_name(name, arch) == f"{record['library']}_{arch}"
+            if arch in record["arches"]:
+                assert pkg.library_name(name, arch) == f"{record['library']}_{arch}"
+            else:
+                with pytest.raises(RuntimeError):
+                    pkg.library_name(name, arch)
         for arch in ("sm_90a", "sm_110a", "sm_120a"):
             with pytest.raises(RuntimeError):
                 pkg.library_name(name, arch)
@@ -363,7 +703,7 @@ def test_capabilities_map_to_the_three_architectures(monkeypatch) -> None:
 
 def test_scalars_are_keywords_with_the_model_defaults() -> None:
     """``beta`` and ``lb`` are keyword-only everywhere, with the model's values 4.0 and 25.0 as defaults."""
-    for entry in (forward, backward, situ_glu):
+    for entry in (forward, backward, recompute, situ_glu):
         for name, default in (("beta", 4.0), ("lb", 25.0)):
             parameter = inspect.signature(entry).parameters[name]
             assert parameter.kind is parameter.KEYWORD_ONLY, (entry.__name__, name)
@@ -380,20 +720,28 @@ def test_cpu_tensors_are_refused() -> None:
     with pytest.raises(ValueError, match="CUDA"):
         backward(x[:, :3072], x)
     with pytest.raises(ValueError, match="CUDA"):
+        recompute(x[:, :3072], x)
+    with pytest.raises(ValueError, match="CUDA"):
         situ_glu(x)
 
 
 def test_manifest_covers_every_record_and_its_sources() -> None:
+    """One library per record and architecture it is delivered for (13: four on ``sm_100a`` and ``sm_103a``, five on
+    ``sm_107a``), each with its minimum CUDA toolkit and the digests of its sources."""
     manifest = _manifest_or_skip()
     assert manifest["schema"] == "cake-build/1"
     assert manifest["package"] == PACKAGE_IMPORT
     entries = {entry["name"]: entry for entry in manifest["libraries"]}
     wanted = {f"{record['library']}_{arch}" for record in cake_jit.MODULES.values() for arch in record["arches"]}
     assert set(entries) == wanted
-    assert len(entries) == len(cake_jit.MODULES) * len(ARCHES)
+    assert len(entries) == len(manifest["libraries"]) == 13
+    per_arch = {arch: sum(entry["arch"] == arch for entry in entries.values()) for arch in ARCHES}
+    assert per_arch == {"sm_100a": 4, "sm_103a": 4, "sm_107a": 5}
+    min_cuda = {"sm_100a": "12.8", "sm_103a": "12.9", "sm_107a": "13.5"}
     for name, entry in entries.items():
         assert entry["arch"] in ARCHES, name
         assert name.endswith("_" + entry["arch"]), name
+        assert entry["min_cuda"] == min_cuda[entry["arch"]], name
         assert entry["path"] == f"aot/{name}.so", name
         assert entry["entry"] == "run", name
         for rel, digest in entry["sha256"].items():
@@ -510,10 +858,15 @@ def test_the_package_reads_no_environment_variable() -> None:
 
 
 def test_the_records_load(device) -> None:
+    """Every record delivered for the device's architecture loads; the others are not built for it."""
     arch = pkg.device_arch(device.index)
     assert arch in ARCHES
     for name, record in cake_jit.MODULES.items():
-        assert callable(getattr(pkg.load(name, arch), record["ffi_entry"])), name
+        if arch in record["arches"]:
+            assert callable(getattr(pkg.load(name, arch), record["ffi_entry"])), name
+        else:
+            with pytest.raises(RuntimeError):
+                pkg.load(name, arch)
 
 
 @pytest.mark.parametrize("case", CASES, ids=[case.id for case in CASES])
@@ -590,8 +943,8 @@ def test_saturated_inputs_are_finite_with_the_oracle_signs(layout, beta, lb, dev
 
 @pytest.mark.parametrize("layout", ["split", "merged", "sliced"])
 def test_no_rows_return_empty_outputs_and_launch_nothing(layout, device, monkeypatch) -> None:
-    """``R = 0``: the steps and the autograd function return empty outputs of the right shapes and dtypes, and
-    nothing is launched or loaded."""
+    """``R = 0``: the steps, the fused backward and the autograd function return empty outputs of the right shapes
+    and dtypes, and nothing is launched or loaded."""
 
     def refuse(*args, **kwargs):
         raise AssertionError("a call with no rows launched or loaded a kernel")
@@ -608,6 +961,12 @@ def test_no_rows_return_empty_outputs_and_launch_nothing(layout, device, monkeyp
     else:
         assert d_first.shape == (0, 3072) and d_up.shape == (0, 3072)
     assert d_first.dtype == torch.bfloat16
+    h, d_first, d_up = recompute(t.dh, t.first, t.second)
+    assert h.shape == (0, 3072) and h.dtype == torch.bfloat16 and h.device == device
+    if layout == "merged":
+        assert d_first.shape == (0, 2 * 3072) and d_up is None
+    else:
+        assert d_first.shape == (0, 3072) and d_up.shape == (0, 3072)
     leaves = _leaves(t)
     out = situ_glu(*leaves)
     assert out.shape == (0, 3072)
@@ -617,9 +976,10 @@ def test_no_rows_return_empty_outputs_and_launch_nothing(layout, device, monkeyp
             assert leaf.grad.shape == leaf.shape
 
 
-def test_one_library_per_stage_serves_every_call(device, monkeypatch) -> None:
-    """Row counts 1 to 4097, widths 256 to 33792, every layout and other scalars load one library per stage, once: no
-    recompilation (``rows``, ``width``, ``beta``, ``lb`` and the strides are launch arguments)."""
+def test_one_library_per_program_serves_every_call(device, monkeypatch) -> None:
+    """Row counts 1 to 16380, widths 256 to 33792, every layout and other scalars load one library per program that a
+    call routes to, once: no recompilation (``rows``, ``width``, ``beta``, ``lb`` and the strides are launch
+    arguments)."""
     cake_build = cake_package("cake_situ_glu_det_train", "cake_build")
     loaded: list[str] = []
     load_library = cake_build.load_library
@@ -638,15 +998,23 @@ def test_one_library_per_stage_serves_every_call(device, monkeypatch) -> None:
         Case(129, 6144, "copied"),
         Case(2, 33792, "merged", beta=3.0),
         Case(16380, 6144),
+        Case(16380, 3072, "merged"),
     )
     try:
         for case in cases:
-            step_outputs(forward, backward, make_inputs(case, seed=5, device=device))
+            t = make_inputs(case, seed=5, device=device)
+            for stage in STAGES:
+                _stage_outputs(stage, t)
     finally:
         pkg.load.cache_clear()
         pkg._entry.cache_clear()
-    arch = pkg.device_arch(device.index)
-    assert sorted(loaded) == sorted(pkg.library_name(cake_jit.PROGRAM_OF[stage], arch) for stage in STAGES)
+    arch, sm_count = _device_facts(device)
+    want = {
+        pkg.library_name(cake_jit.select(stage, arch, sm_count, case.R, case.I), arch)
+        for case in cases
+        for stage in STAGES
+    }
+    assert sorted(loaded) == sorted(want)
 
 
 @pytest.mark.parametrize(
@@ -671,15 +1039,72 @@ def test_layouts_give_the_same_bits(width, device) -> None:
         assert_same_outputs(step_outputs(forward, backward, _relayout(t, layout)), want, layout)
 
 
-@pytest.mark.parametrize("layout", ["split", "merged"])
-def test_rows_do_not_depend_on_the_row_count(layout, device) -> None:
-    """A row's outputs are the same bits whatever the other rows and the row count (each row is computed alone)."""
-    t = make_inputs(Case(4097, 3072, layout, "wide"), seed=9, device=device)
-    full = step_outputs(forward, backward, t)
-    for rows in (1, 7, 129, 1000):
-        part = step_outputs(forward, backward, _rows(t, rows))
-        for name, value in part.items():
-            assert_same_bits(value, full[name][:rows], f"{name} of the first {rows} rows")
+def _stage_shapes(stage: str, arch: str, sm_count: int) -> list[tuple[int, int]]:
+    """Shapes of ``stage`` that every program of it runs in the suite: one row, odd row counts (two rows a CTA leave
+    one alone), a partial pass of the CTA, the issue's dense width, and each rows-per-SM edge (one row below, at and
+    above it, at a width in the route's band)."""
+    shapes = [(1, 3072), (3, 2048), (129, 256), (1025, 6144), (257, 33792), (4097, 5120)]
+    for rows, width in _route_edges(stage, arch, sm_count):
+        shapes += [(rows - 1, width), (rows, width), (rows + 1, width)]
+    return shapes
+
+
+@pytest.mark.parametrize("stage", STAGES)
+def test_every_program_stores_the_bits_of_its_stage(stage, device, monkeypatch) -> None:
+    """Every program of ``stage`` on the device's architecture, forced through the private hook (``_launch_program``)
+    on its full grid, on a grid of one CTA an SM and on each cap its routes state, stores the bits of the stage's last
+    route's program on its full grid: at the stage's shapes (:func:`_stage_shapes`), merged and two tensors, at the
+    model's scalars and at ``beta`` 2.5, ``lb`` 10.  Programs of other architectures are not run."""
+    arch, sm_count = _device_facts(device)
+    names = _programs_of(stage, arch)
+    default = cake_jit.ROUTES[stage][arch][-1]["program"]
+    caps = {name: {None, 1} for name in names}
+    for entry in cake_jit.ROUTES[stage][arch]:
+        caps[entry["program"]].add(entry["ctas_per_sm"])
+    for (rows, width), layout, (beta, lb) in itertools.product(
+        _stage_shapes(stage, arch, sm_count), ("split", "merged"), ((BETA, LB), (2.5, 10.0))
+    ):
+        t = make_inputs(Case(rows, width, layout, beta=beta, lb=lb), seed=rows % 97, device=device)
+        with _forced(monkeypatch, default):
+            want = _stage_outputs(stage, t)
+        for name in names:
+            for cap in sorted(caps[name], key=lambda c: -1 if c is None else c):
+                with _forced(monkeypatch, name, cap):
+                    got = _stage_outputs(stage, t)
+                assert_same_outputs(got, want, f"{name} cap {cap} at R {rows} I {width} {layout} beta {beta}")
+
+
+@pytest.mark.parametrize("stage", STAGES)
+def test_the_route_changes_no_bit(stage, device) -> None:
+    """At each rows-per-SM edge ``e`` of the stage on the device: the first ``e - 1`` rows of calls on ``e - 1``,
+    ``e`` and ``e + 1`` rows (views of one input) are the same bits, though the calls run different programs or caps.
+    At each width-band edge: the columns of the narrower call are the same bits as those columns of a call one segment
+    wider (the narrower inputs are column slices of the wider ones, read in place)."""
+    arch, sm_count = _device_facts(device)
+    rows_edges = _route_edges(stage, arch, sm_count)
+    width_edges = _width_edges(stage, arch, sm_count)
+    if not rows_edges and not width_edges:
+        pytest.skip(f"{stage} has one route on {arch}")
+    for layout in ("split", "merged"):
+        for edge, width in rows_edges:
+            t = make_inputs(Case(edge + 1, width, layout), seed=edge % 89, device=device)
+            programs = {cake_jit.select(stage, arch, sm_count, r, width) for r in (edge - 1, edge)}
+            want = _stage_outputs(stage, _rows(t, edge - 1))
+            for rows in (edge, edge + 1):
+                got = _stage_outputs(stage, _rows(t, rows))
+                for name, value in got.items():
+                    assert_same_bits(value[: edge - 1], want[name], f"{name}: R {rows} vs {edge - 1} {programs}")
+    for rows, inside, outside in width_edges:
+        narrow, wide = sorted((inside, outside))
+        t = make_inputs(Case(rows, wide, "split"), seed=wide % 83, device=device)
+        part = types.SimpleNamespace(R=rows, I=narrow, beta=t.beta, lb=t.lb, layout="sliced")
+        part.gate, part.up, part.dh = t.gate[:, :narrow], t.up[:, :narrow], t.dh[:, :narrow]
+        part.first, part.second = part.gate, part.up
+        programs = {cake_jit.select(stage, arch, sm_count, rows, w) for w in (narrow, wide)}
+        want = _stage_outputs(stage, t)
+        got = _stage_outputs(stage, part)
+        for name, value in got.items():
+            assert_same_bits(value, want[name][:, :narrow], f"{name}: I {narrow} vs {wide} at R {rows} {programs}")
 
 
 @pytest.mark.parametrize(
@@ -690,8 +1115,8 @@ def test_rows_do_not_depend_on_the_row_count(layout, device) -> None:
 def test_large_row_counts(rows, width, device) -> None:
     """The issue's routed call (262,144 rows), 1,048,576 rows, and 65,536 rows of the dense width, merged: byte
     offsets past 2**31 in every case, element offsets past 2**32 in the last two.  Finite outputs, the same bits at a
-    second call, and the first and the last 4097 rows the bits of a call on those 4097 rows (views of the inputs, the
-    last ones at a large row offset)."""
+    second call and in the fused backward, and the first and the last 4097 rows the bits of a call on those 4097 rows
+    (views of the inputs, the last ones at a large row offset)."""
     t = _large_inputs(rows, width, seed=31, device=device)
     want = step_outputs(forward, backward, t)
     for name, value in want.items():
@@ -699,6 +1124,11 @@ def test_large_row_counts(rows, width, device) -> None:
     again = step_outputs(forward, backward, t)
     assert_same_outputs(again, want, "second call")
     del again
+    h, d_first, _ = recompute(t.dh, t.first, None)
+    assert_same_bits(h, want["h"], "fused backward: h")
+    assert_same_bits(d_first[:, :width], want["d_gate"], "fused backward: d_gate")
+    assert_same_bits(d_first[:, width:], want["d_up"], "fused backward: d_up")
+    del h, d_first
     for offset in (0, rows - 4097):
         part = step_outputs(forward, backward, _rows(t, 4097, offset=offset))
         for name, value in part.items():
@@ -762,6 +1192,146 @@ def test_autograd_returns_the_gradients_that_are_needed(device) -> None:
     assert_same_bits(leaves[0].grad, d_first, "merged gradient of h.sum()")
 
 
+def _ckpt_shapes(arch: str, sm_count: int) -> list[tuple[int, int]]:
+    """Row counts 0 and 1, odd counts, the fused backward's rows-per-SM edges on ``arch`` (one row below, at and above)
+    and both sides of its width bands."""
+    shapes = [(0, 3072), (1, 3072), (1, 256), (129, 6144), (1025, 5120)]
+    for rows, width in _route_edges("ckpt", arch, sm_count):
+        shapes += [(rows - 1, width), (rows, width), (rows + 1, width)]
+    for rows, inside, outside in _width_edges("ckpt", arch, sm_count):
+        shapes += [(rows, inside), (rows, outside)]
+    return shapes
+
+
+@pytest.mark.parametrize(("beta", "lb"), [(BETA, LB), (2.5, 10.0)], ids=["model", "other"])
+@pytest.mark.parametrize("layout", ["split", "merged"])
+def test_recompute_h_is_the_forward_bits(layout, beta, lb, device) -> None:
+    """The fused backward of a checkpointed step stores ``h`` with the forward's bits and ``d_gate`` and ``d_up`` with
+    the backward's bits (one ``[R, 2I]`` gradient for a merged input), at ``R`` 0 and 1, odd row counts, its route
+    edges and both sides of its width bands, at the model's and other scalars."""
+    arch, sm_count = _device_facts(device)
+    for rows, width in _ckpt_shapes(arch, sm_count):
+        t = make_inputs(Case(rows, width, layout, beta=beta, lb=lb), seed=rows % 71, device=device)
+        want = _functional(t)
+        got = _stage_outputs("ckpt", t)
+        assert_same_outputs(got, want, f"R {rows} I {width} ({cake_jit.select('ckpt', arch, sm_count, rows, width)})")
+        if layout == "merged":
+            assert got["d_first"].shape == (rows, 2 * width) and "d_up" not in got
+
+
+def test_recompute_buffers_and_refusals(device, launches) -> None:
+    """The fused backward writes preallocated outputs (contiguous, or row slices of wider aligned buffers) and returns
+    them, with the bits of new outputs; it reads the inputs in place as the backward does (the halves of a merged
+    input, ``dh``) and passes ``h`` and its row stride; unfit outputs, ``grad_up`` with a merged input and wrong
+    operands are refused before any launch."""
+    width = 3072
+    t = make_inputs(Case(65, width, "merged"), seed=16, device=device)
+    want = _functional(t)
+
+    def wide(rows, cols, pad=8):
+        return torch.empty(rows, cols + 2 * pad, dtype=torch.bfloat16, device=device)[:, pad : pad + cols]
+
+    for h, d_gu in (
+        (torch.empty(t.R, width, dtype=torch.bfloat16, device=device), None),
+        (wide(t.R, width), wide(t.R, 2 * width)),
+    ):
+        result = recompute(t.dh, t.first, None, out=h, grad_gate_up_or_gate=d_gu)
+        assert result[0] is h and (d_gu is None or result[1] is d_gu) and result[2] is None
+        assert_same_bits(h, want["h"], "out")
+        assert_same_bits(result[1], want["d_first"], "grad_gate_up_or_gate")
+    stage, rows, cols, values = launches[-1]
+    assert (stage, rows, cols) == ("ckpt", t.R, width)
+    assert values["gate"].data_ptr() == t.gate_up.data_ptr()
+    assert values["up"].data_ptr() == t.gate_up.data_ptr() + 2 * width
+    assert values["h"].data_ptr() == h.data_ptr() and values["h_stride"] == h.stride(0) == width + 16
+    assert values["d_up"].data_ptr() == values["d_gate"].data_ptr() + 2 * width
+
+    s = make_inputs(Case(65, width, "split"), seed=17, device=device)
+    want_s = _functional(s)
+    h, d_gate, d_up = wide(s.R, width), wide(s.R, width), wide(s.R, width)
+    result = recompute(s.dh, s.gate, s.up, out=h, grad_gate_up_or_gate=d_gate, grad_up=d_up)
+    assert result[0] is h and result[1] is d_gate and result[2] is d_up
+    assert_same_outputs({"h": h, "d_first": d_gate, "d_up": d_up}, want_s, "split buffers")
+
+    launches.clear()
+    raw = torch.empty(t.R * 2 * width + 64, dtype=torch.bfloat16, device=device)
+    unfit = {
+        "an FP32 output": torch.empty(t.R, width, device=device),
+        "another shape": torch.empty(t.R + 1, width, dtype=torch.bfloat16, device=device),
+        "a base that is not 16-byte aligned": raw[1 : 1 + t.R * width].view(t.R, width),
+        "a row stride that is not a multiple of 8": raw[: t.R * (width + 2)].view(t.R, width + 2)[:, :width],
+        "overlapping rows": raw.as_strided((t.R, width), (8, 1)),
+        "a non-unit last stride": raw[: t.R * width * 2].view(t.R, width, 2)[:, :, 0],
+    }
+    for what, buffer in unfit.items():
+        for kwargs in ({"out": buffer}, {"grad_gate_up_or_gate": buffer}, {"grad_up": buffer}):
+            with pytest.raises(ValueError):
+                recompute(s.dh, s.gate, s.up, **kwargs)
+    with pytest.raises(ValueError, match="grad_up"):
+        recompute(t.dh, t.first, None, grad_up=torch.empty_like(t.dh))
+    with pytest.raises(ValueError):
+        recompute(t.dh[:, :256], t.first, None)
+    with pytest.raises(ValueError):
+        recompute(t.dh, t.first, None, beta=1e-39)
+    with pytest.raises(TypeError):
+        recompute(t.dh, t.first, None, beta=torch.tensor(4.0))
+    with pytest.raises(TypeError):
+        recompute(t.dh, t.first, None, 4.0)
+    assert launches == []
+
+
+class SituDown(torch.autograd.Function):
+    """The documentation's example: SiTU-GLU and the down projection, checkpointed by hand.  The forward keeps only
+    ``gate_up`` and ``w_down``; the backward takes the down projection's input gradient first, then ``h`` and the
+    gradients of ``gate_up`` from one fused call, then the weight gradient from that ``h``."""
+
+    @staticmethod
+    def forward(ctx, gate_up, w_down):
+        h = forward(gate_up)
+        ctx.save_for_backward(gate_up, w_down)  # h is not kept
+        return torch.nn.functional.linear(h, w_down)
+
+    @staticmethod
+    def backward(ctx, dy):
+        gate_up, w_down = ctx.saved_tensors
+        dy2 = dy.reshape(-1, dy.shape[-1])
+        dh = dy2 @ w_down  # 1. dgrad of down: needs no h
+        h, d_gate_up, _ = recompute(dh, gate_up)  # 2. h + grads
+        d_w_down = dy2.t() @ h  # 3. wgrad with the recomputed h
+        return d_gate_up, d_w_down
+
+
+def test_autograd_example_recompute_order(device) -> None:
+    """The documentation's ``SituDown`` example saves only ``gate_up`` and ``w_down`` (no ``h``), gives the output and
+    the ``gate_up`` gradient bits of the package's autograd function followed by the same down projection, and the
+    weight gradient ``dy^T h`` of the forward's ``h``."""
+    rows, width, hidden = 1031, 3072, 1024
+    gen = torch.Generator(device=device).manual_seed(77)
+    gate_up = (2.0 * torch.randn(rows, 2 * width, device=device, generator=gen)).bfloat16()
+    w_down = (torch.randn(hidden, width, device=device, generator=gen) / width**0.5).bfloat16()
+    dy = torch.randn(rows, hidden, device=device, generator=gen).bfloat16()
+
+    saved = []
+
+    def pack(x):
+        saved.append((x.data_ptr(), tuple(x.shape), x.dtype))
+        return x
+
+    gu, w = gate_up.clone().requires_grad_(True), w_down.clone().requires_grad_(True)
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda x: x):
+        y = SituDown.apply(gu, w)
+    assert sorted(saved) == sorted([(x.data_ptr(), tuple(x.shape), x.dtype) for x in (gu, w)])
+    y.backward(dy)
+
+    gu2, w2 = gate_up.clone().requires_grad_(True), w_down.clone().requires_grad_(True)
+    y2 = torch.nn.functional.linear(situ_glu(gu2), w2)
+    y2.backward(dy)
+    assert_same_bits(y.detach(), y2.detach(), "output")
+    assert_same_bits(gu.grad, gu2.grad, "d_gate_up")
+    h_fwd = forward(gate_up)
+    assert_same_bits(w.grad, dy.t() @ h_fwd, "d_w_down = dy^T h")
+
+
 @pytest.mark.parametrize("layout", ["split", "merged"])
 def test_double_backward_raises(layout, device) -> None:
     """Gradients computed with ``create_graph=True`` and an upstream gradient that requires grad have the steps' bits,
@@ -803,10 +1373,103 @@ def test_side_stream_and_no_host_sync(device) -> None:
     assert_same_bits(leaves[0].grad, want_autograd["d_first"], "autograd gradient on a side stream")
 
 
+def _route_shapes(stage: str, arch: str, sm_count: int) -> list[tuple[int, int]]:
+    """One ``(rows, width)`` per route of ``stage`` on ``arch`` that runs it: the route's least row count (at least
+    one) at the low edge of its band, or one row at width 256 for the last route."""
+    shapes = []
+    for entry in cake_jit.ROUTES[stage][arch]:
+        rows = max(1, entry["min_rows_per_sm"] * sm_count)
+        width = entry["width"][0] if entry["width"] is not None else 256
+        assert cake_jit.route(stage, arch, sm_count, rows, width) is entry, (stage, arch, entry)
+        shapes.append((rows, width))
+    return shapes
+
+
+@pytest.mark.parametrize("stage", STAGES)
+def test_no_host_sync_at_every_route(stage, device) -> None:
+    """At a shape of each route of the stage on the device, a call on a side stream under
+    ``torch.cuda.set_sync_debug_mode("error")`` neither synchronizes nor reads the device (after one warm-up call that
+    loads the library), and gives the bits of the same call on the default stream."""
+    arch, sm_count = _device_facts(device)
+    for rows, width in _route_shapes(stage, arch, sm_count):
+        t = make_inputs(Case(rows, width, "merged"), seed=rows % 61, device=device)
+        want = _stage_outputs(stage, t)
+        torch.cuda.synchronize(device)
+        stream = torch.cuda.Stream(device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            with torch.cuda.stream(stream):
+                got = _stage_outputs(stage, t)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.current_stream(device).wait_stream(stream)
+        torch.cuda.synchronize(device)
+        assert_same_outputs(got, want, f"{stage} R {rows} I {width}")
+
+
+def test_cuda_graph_capture_across_route_edges(device) -> None:
+    """The forward, the backward and the fused backward at both sides of every rows-per-SM and width-band edge of the
+    device (merged, preallocated outputs), each shape warmed up by one eager call, captured once in one graph and
+    replayed twice on new inputs copied into the captured tensors: each replay gives the bits of eager calls on those
+    inputs (the programs the capture chose run again)."""
+    arch, sm_count = _device_facts(device)
+    shapes = set()
+    for stage in STAGES:
+        for rows, width in _route_edges(stage, arch, sm_count):
+            shapes |= {(rows - 1, width), (rows, width)}
+        for rows, inside, outside in _width_edges(stage, arch, sm_count):
+            shapes |= {(rows, inside), (rows, outside)}
+    shapes = sorted(shapes)
+    slots = []
+    for rows, width in shapes:
+        t = make_inputs(Case(rows, width, "merged"), seed=1, device=device)
+        slot = types.SimpleNamespace(rows=rows, width=width, gu=t.gate_up.clone(), dh=t.dh.clone())
+        slot.h = torch.empty(rows, width, dtype=torch.bfloat16, device=device)
+        slot.d = torch.empty(rows, 2 * width, dtype=torch.bfloat16, device=device)
+        slot.h2 = torch.empty_like(slot.h)
+        slot.d2 = torch.empty_like(slot.d)
+        slots.append(slot)
+
+    def step():
+        for slot in slots:
+            forward(slot.gu, None, out=slot.h)
+            backward(slot.dh, slot.gu, None, grad_gate_up_or_gate=slot.d)
+            recompute(slot.dh, slot.gu, None, out=slot.h2, grad_gate_up_or_gate=slot.d2)
+
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        step()  # loads every library a shape routes to, before the capture
+    torch.cuda.current_stream(device).wait_stream(side)
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    for k in range(2):
+        news = []
+        for slot in slots:
+            n = make_inputs(Case(slot.rows, slot.width, "merged"), seed=100 + k, device=device)
+            slot.gu.copy_(n.gate_up)
+            slot.dh.copy_(n.dh)
+            for buffer in (slot.h, slot.d, slot.h2, slot.d2):
+                buffer.zero_()
+            news.append(n)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        for slot, n in zip(slots, news, strict=True):
+            want = _functional(n)
+            what = f"replay {k}: R {slot.rows} I {slot.width}"
+            assert_same_bits(slot.h, want["h"], f"{what}: h")
+            assert_same_bits(slot.d, want["d_first"], f"{what}: d_gate_up")
+            assert_same_bits(slot.h2, want["h"], f"{what}: fused h")
+            assert_same_bits(slot.d2, want["d_first"], f"{what}: fused d_gate_up")
+
+
 def test_cuda_graph_capture_and_replay(device) -> None:
-    """A merged step at the model's scalars and a two-tensor step at another width and other scalars, with
-    preallocated outputs, captured once after a warm-up call and replayed three times on new inputs copied into the
-    captured tensors: each replay gives the bits of eager calls on those inputs."""
+    """A merged step at the model's scalars and a two-tensor step (with the fused backward) at another width and
+    other scalars, with preallocated outputs, captured once after a warm-up call and replayed three times on new inputs
+    copied into the captured tensors: each replay gives the bits of eager calls on those inputs."""
     R = 300
     a_case = Case(R, 3072, "merged")
     b_case = Case(R, 6144, "split", beta=2.5, lb=10.0)
@@ -819,11 +1482,14 @@ def test_cuda_graph_capture_and_replay(device) -> None:
     h_b = torch.empty(R, 6144, dtype=torch.bfloat16, device=device)
     d_gate, d_up = torch.empty_like(h_b), torch.empty_like(h_b)
 
+    h_c, d_gate_c, d_up_c = torch.empty_like(h_b), torch.empty_like(h_b), torch.empty_like(h_b)
+
     def step():
         forward(gu, None, out=h_a)
         backward(dh_a, gu, None, grad_gate_up_or_gate=d_gu)
         forward(gate, up, beta=b.beta, lb=b.lb, out=h_b)
         backward(dh_b, gate, up, beta=b.beta, lb=b.lb, grad_gate_up_or_gate=d_gate, grad_up=d_up)
+        recompute(dh_b, gate, up, beta=b.beta, lb=b.lb, out=h_c, grad_gate_up_or_gate=d_gate_c, grad_up=d_up_c)
 
     side = torch.cuda.Stream(device)
     side.wait_stream(torch.cuda.current_stream(device))
@@ -842,7 +1508,7 @@ def test_cuda_graph_capture_and_replay(device) -> None:
         gate.copy_(nb.gate)
         up.copy_(nb.up)
         dh_b.copy_(nb.dh)
-        for buffer in (h_a, d_gu, h_b, d_gate, d_up):
+        for buffer in (h_a, d_gu, h_b, d_gate, d_up, h_c, d_gate_c, d_up_c):
             buffer.zero_()
         graph.replay()
         torch.cuda.synchronize(device)
@@ -853,6 +1519,9 @@ def test_cuda_graph_capture_and_replay(device) -> None:
         assert_same_bits(h_b, want_b["h"], f"replay {k}: h (two tensors)")
         assert_same_bits(d_gate, want_b["d_first"], f"replay {k}: d_gate")
         assert_same_bits(d_up, want_b["d_up"], f"replay {k}: d_up")
+        assert_same_bits(h_c, want_b["h"], f"replay {k}: fused h")
+        assert_same_bits(d_gate_c, want_b["d_first"], f"replay {k}: fused d_gate")
+        assert_same_bits(d_up_c, want_b["d_up"], f"replay {k}: fused d_up")
 
 
 @pytest.mark.parametrize("warn_only", [False, True], ids=["strict", "warn_only"])
@@ -867,6 +1536,8 @@ def test_steps_neither_raise_nor_warn_under_deterministic_algorithms(warn_only, 
         return [
             step_outputs(forward, backward, t),
             step_outputs(forward, backward, u),
+            _stage_outputs("ckpt", t),
+            _stage_outputs("ckpt", u),
             _autograd_step(t),
             _autograd_step(t, checkpoint=True),
         ]
@@ -892,18 +1563,19 @@ def test_steps_neither_raise_nor_warn_under_deterministic_algorithms(warn_only, 
 def test_fit_inputs_are_read_in_place_and_others_copied_once(device, launches) -> None:
     """The halves of a merged input and row slices of wider buffers reach the kernels as views of the caller's memory
     (their row strides), with no copy; rows the kernels cannot read are copied once to contiguous rows; a single row's
-    stride is passed as 0; the width and the FP32 scalars are launch arguments."""
+    stride is passed as 0; the width, the FP32 scalars and the host's ``k1`` and ``k2`` are launch arguments."""
     m = make_inputs(Case(33, 3072, "merged"), seed=2, device=device)
     forward(m.first, None)
-    stage, rows, values = launches[-1]
-    assert stage == "fwd" and rows == 33
+    stage, rows, width, values = launches[-1]
+    assert stage == "fwd" and rows == 33 and width == 3072
     assert values["gate"].data_ptr() == m.gate_up.data_ptr()
     assert values["up"].data_ptr() == m.gate_up.data_ptr() + 2 * 3072
     assert values["gate_stride"] == values["up_stride"] == 2 * 3072
     assert values["width"] == 3072 and values["h_stride"] == 3072
     assert values["beta"] == 4.0 and values["lb"] == 25.0
+    assert (values["k1"], values["k2"]) == pkg._scalars(4.0, 25.0)[2:]
     backward(m.dh, m.first, None)
-    stage, _, values = launches[-1]
+    stage, _, _, values = launches[-1]
     assert stage == "bwd"
     assert values["gate"].data_ptr() == m.gate_up.data_ptr()
     assert values["dh"].data_ptr() == m.dh.data_ptr()
@@ -912,24 +1584,25 @@ def test_fit_inputs_are_read_in_place_and_others_copied_once(device, launches) -
 
     s = make_inputs(Case(33, 6144, "sliced"), seed=2, device=device)
     backward(s.dh, s.gate, s.up, beta=2.5, lb=10.0)
-    _, _, values = launches[-1]
+    _, _, _, values = launches[-1]
     for name, tensor in (("gate", s.gate), ("up", s.up), ("dh", s.dh)):
         assert values[name].data_ptr() == tensor.data_ptr(), name
         assert values[f"{name}_stride"] == tensor.stride(0) != 6144, name
     assert values["width"] == 6144 and values["beta"] == 2.5 and values["lb"] == 10.0
+    assert (values["k1"], values["k2"]) == pkg._scalars(2.5, 10.0)[2:]
 
     c = make_inputs(Case(33, 3072, "copied"), seed=2, device=device)
     backward(c.dh, c.gate, c.up, beta=7.3)
-    _, _, values = launches[-1]
+    _, _, _, values = launches[-1]
     for name, tensor in (("gate", c.gate), ("up", c.up), ("dh", c.dh)):
         assert values[name].data_ptr() != tensor.data_ptr(), name
         assert values[name].is_contiguous() and values[f"{name}_stride"] == 3072, name
     assert values["beta"] == fp32(7.3)
 
     one = make_inputs(Case(1, 3072, "merged"), seed=2, device=device)
-    backward(one.dh, one.first, None)
-    _, _, values = launches[-1]
-    for name in ("gate", "up", "dh", "d_gate", "d_up"):
+    recompute(one.dh, one.first, None)
+    _, _, _, values = launches[-1]
+    for name in ("gate", "up", "dh", "d_gate", "d_up", "h"):
         assert values[f"{name}_stride"] == 0, name
 
 
@@ -1008,8 +1681,11 @@ def test_operand_and_scalar_errors(device, launches) -> None:
         "a negative lb": lambda: forward(gate, up, lb=-1.0),
         "a beta past FP32": lambda: forward(gate, up, beta=1e39),
         "an lb that rounds to 0 in FP32": lambda: forward(gate, up, lb=1e-50),
-        "a beta whose 2.88539 / beta is past FP32": lambda: forward(gate, up, beta=1e-39),
-        "an lb whose 2.88539 / lb is past FP32 in the backward": lambda: backward(dh, gate, up, lb=1e-39),
+        "a beta whose k1 = -2 log2(e) / beta is past FP32": lambda: forward(gate, up, beta=1e-39),
+        "an lb whose k2 = -2 log2(e) / lb is past FP32 in the backward": lambda: backward(dh, gate, up, lb=1e-39),
+        "an lb whose k2 is past FP32 in the fused backward": lambda: recompute(dh, gate, up, lb=1e-39),
+        "an FP32 dh in the fused backward": lambda: recompute(dh.float(), gate, up),
+        "an up of another width in the fused backward": lambda: recompute(dh, gate, up[:, :2816]),
         "a beta lb product past FP32 in the autograd entry": lambda: situ_glu(gate, up, beta=1e20, lb=1e20),
         "a beta whose beta (1 + 2^-21) is past FP32": lambda: forward(gate, up, beta=FP32_MAX, lb=0.5),
         "an lb whose lb (1 + 2^-21) is past FP32 in the backward": lambda: backward(
@@ -1025,6 +1701,8 @@ def test_operand_and_scalar_errors(device, launches) -> None:
         "a list gate": lambda: forward([1.0], up),
         "a tensor lb in the autograd entry": lambda: situ_glu(gate, up, lb=torch.tensor(25.0)),
         "a tensor beta in the backward": lambda: backward(dh, gate, up, beta=torch.tensor(4.0)),
+        "a tensor lb in the fused backward": lambda: recompute(dh, gate, up, lb=torch.tensor(25.0)),
+        "a list dh in the fused backward": lambda: recompute([1.0], gate, up),
     }
     misses = []
     for kind, calls in ((ValueError, value_errors), (TypeError, type_errors)):
@@ -1052,6 +1730,8 @@ def test_unsupported_devices_raise(device, monkeypatch) -> None:
             forward(t.first[:rows], None)
         with pytest.raises(RuntimeError, match="sm_100a"):
             backward(t.dh[:rows], t.first[:rows], None)
+        with pytest.raises(RuntimeError, match="sm_100a"):
+            recompute(t.dh[:rows], t.first[:rows], None)
 
 
 def test_operands_on_another_device(device) -> None:
