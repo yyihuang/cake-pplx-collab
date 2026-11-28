@@ -36,8 +36,9 @@ Host design (every control is an argument; no environment variable):
   ``k2 = -2 log2(e) / lb`` (FP32 divisions by :data:`TWO_LOG2E_F32`),
   ``beta lb``, ``beta (1 + 2^-21)`` and ``lb (1 + 2^-21)`` finite in FP32,
   the constants the kernels form or take (``ValueError`` otherwise); they are
-  launch arguments, as are ``R``, ``I`` and the strides, so one build serves
-  every call.  The tests cover ``beta`` in ``[2.5, 4]`` and ``lb`` in
+  launch arguments, as are ``R``, ``I`` and the strides, so one library per
+  program and architecture serves every call routed to it, with no
+  recompilation.  The tests cover ``beta`` in ``[2.5, 4]`` and ``lb`` in
   ``[10, 40]``.
 - Outputs.  ``h`` is a new contiguous BF16 ``[R, I]`` tensor, or the caller's
   ``out``.  The gradients ``d_gate`` and ``d_up`` (of the backward and of the

@@ -35,16 +35,17 @@ and copied layouts, saturated, deep negative, small and wide values, zero gates 
 other than the model's, and tiny gates or ups, one magnitude band a case, down to ``2^-60 beta`` and ``2^-60 lb``.
 Beside the judge, exact facts of the contract (no tolerance): every program of a stage on the device's architecture
 stores the bits of the stage's last route (forced through a private hook, at the route edges, odd row counts, both
-layouts, two values of ``beta``, uncapped and capped grids); the route changes no bit at a row or width edge; the fused
-backward stores the forward's ``h`` and the backward's gradients; ``g = 0`` or ``u = 0`` gives ``h = 0`` exactly (and
-``d_up = 0`` at ``g = 0``, ``d_gate = 0`` at ``u = 0``); saturated inputs give finite outputs with the oracle's signs
-outside the flushed range; ``R = 0`` returns empty outputs and launches nothing; one library per routed program serves
-every call; the same bits at every call, in every layout, at large row counts whose offsets pass 2**31 bytes, on a
-side stream with no host synchronization at every route, in CUDA graph replays (across route edges) and under
-``torch.use_deterministic_algorithms``; the autograd function matches the steps bit for bit, saves only its inputs,
-gives the same bits under non-reentrant checkpointing and has no double backward; the documentation's checkpointed
-``SituDown`` example saves only its inputs and gives the autograd path's gradient bits; inputs the kernels can read are
-read in place, others copied once; unfit outputs, operands and scalars are refused.
+layouts, two values of ``beta``, uncapped and capped grids, on normal, saturated, deep negative, tiny and zero-gate
+values); the route changes no bit at a row or width edge; the fused backward stores the forward's ``h`` and the
+backward's gradients; ``g = 0`` or ``u = 0`` gives ``h = 0`` exactly (and ``d_up = 0`` at ``g = 0``, ``d_gate = 0`` at
+``u = 0``); saturated inputs give finite outputs with the oracle's signs outside the flushed range; ``R = 0`` returns
+empty outputs and launches nothing; one library per routed program serves every call; the same bits at every call, in
+every layout, at large row counts whose offsets pass 2**31 bytes, on a side stream with no host synchronization at every
+route, in CUDA graph replays (across route edges) and under ``torch.use_deterministic_algorithms``; the autograd
+function matches the steps bit for bit, saves only its inputs, gives the same bits under non-reentrant checkpointing and
+has no double backward; the documentation's checkpointed ``SituDown`` example saves only its inputs and gives the
+autograd path's gradient bits; inputs the kernels can read are read in place, others copied once; unfit outputs,
+operands and scalars are refused.
 
 The suite names its package once, through the shared alias helper, and imports nothing else from ``cake_pplx``.
 """
@@ -1049,29 +1050,47 @@ def _stage_shapes(stage: str, arch: str, sm_count: int) -> list[tuple[int, int]]
     return shapes
 
 
+# The data kinds beside the normal values that every program of a stage runs, as ``(data, band)`` (the magnitude band
+# of the tiny kinds): the flushed gradients of saturated values, a subnormal sigmoid at deep negative gates, the
+# smallest tiny gates (``2^-60 beta``), tiny ups and zero gates; each at one shape, with several rows a CTA on a grid
+# of one CTA an SM.
+PROGRAM_DATA = (("saturated", 20), ("deep_negative", 20), ("tiny_gate", 60), ("tiny_up", 7), ("zero_gate", 20))
+PROGRAM_DATA_SHAPE = (1025, 3072)
+
+
 @pytest.mark.parametrize("stage", STAGES)
 def test_every_program_stores_the_bits_of_its_stage(stage, device, monkeypatch) -> None:
     """Every program of ``stage`` on the device's architecture, forced through the private hook (``_launch_program``)
     on its full grid, on a grid of one CTA an SM and on each cap its routes state, stores the bits of the stage's last
-    route's program on its full grid: at the stage's shapes (:func:`_stage_shapes`), merged and two tensors, at the
-    model's scalars and at ``beta`` 2.5, ``lb`` 10.  Programs of other architectures are not run."""
+    route's program on its full grid: normal values at the stage's shapes (:func:`_stage_shapes`) and each data kind
+    of ``PROGRAM_DATA`` at ``PROGRAM_DATA_SHAPE``, merged and two tensors, at the model's scalars and at ``beta`` 2.5,
+    ``lb`` 10.  Programs of other architectures are not run."""
     arch, sm_count = _device_facts(device)
     names = _programs_of(stage, arch)
     default = cake_jit.ROUTES[stage][arch][-1]["program"]
     caps = {name: {None, 1} for name in names}
     for entry in cake_jit.ROUTES[stage][arch]:
         caps[entry["program"]].add(entry["ctas_per_sm"])
-    for (rows, width), layout, (beta, lb) in itertools.product(
-        _stage_shapes(stage, arch, sm_count), ("split", "merged"), ((BETA, LB), (2.5, 10.0))
-    ):
-        t = make_inputs(Case(rows, width, layout, beta=beta, lb=lb), seed=rows % 97, device=device)
+    layouts, scalars = ("split", "merged"), ((BETA, LB), (2.5, 10.0))
+    shapes = _stage_shapes(stage, arch, sm_count)
+    cases = [
+        Case(rows, width, layout, beta=beta, lb=lb)
+        for (rows, width), layout, (beta, lb) in itertools.product(shapes, layouts, scalars)
+    ]
+    rows, width = PROGRAM_DATA_SHAPE
+    cases += [
+        Case(rows, width, layout, data, beta=beta, lb=lb, band=band)
+        for (data, band), layout, (beta, lb) in itertools.product(PROGRAM_DATA, layouts, scalars)
+    ]
+    for case in cases:
+        t = make_inputs(case, seed=case.R % 97, device=device)
         with _forced(monkeypatch, default):
             want = _stage_outputs(stage, t)
         for name in names:
             for cap in sorted(caps[name], key=lambda c: -1 if c is None else c):
                 with _forced(monkeypatch, name, cap):
                     got = _stage_outputs(stage, t)
-                assert_same_outputs(got, want, f"{name} cap {cap} at R {rows} I {width} {layout} beta {beta}")
+                assert_same_outputs(got, want, f"{name} cap {cap} at {case.id}")
 
 
 @pytest.mark.parametrize("stage", STAGES)

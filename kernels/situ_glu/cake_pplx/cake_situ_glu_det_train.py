@@ -35,14 +35,15 @@ at ``beta >= 2.4``, for ``d_gate`` where ``|g| > 43.67 beta``: there the
 exact values are under ``2^-124 |dh| beta`` and about ``2^-124 |dh| lb``
 (the backend's numerics).  The activation is unweighted.
 ``R`` is a run-time value (any ``0 <= R <= 2**30``; ``R = 0`` returns empty
-outputs and launches nothing), and so are ``I`` and the scalars: one build
-serves every call, with no recompilation.  ``beta`` and ``lb`` default to 4.0
-and 25.0, the values of Kimi-K3.1-Pro (``activation_situ_beta`` and
-``activation_situ_linear_beta``).  They must be positive and finite in FP32,
-with the FP32 quotients ``k1 = -2 log2(e) / beta`` and
-``k2 = -2 log2(e) / lb``, ``beta lb``, ``beta (1 + 2^-21)`` and
-``lb (1 + 2^-21)`` finite in FP32 (``ValueError`` otherwise); the tests cover
-``beta`` in ``[2.5, 4]`` and ``lb`` in ``[10, 40]``.
+outputs and launches nothing), and so are ``I`` and the scalars: one library
+per program and architecture serves every call routed to it, with no
+recompilation.  ``beta`` and ``lb`` default to 4.0 and 25.0, the values of
+Kimi-K3.1-Pro (``activation_situ_beta`` and ``activation_situ_linear_beta``).
+They must be positive and finite in FP32, with the FP32 quotients
+``k1 = -2 log2(e) / beta`` and ``k2 = -2 log2(e) / lb``, ``beta lb``,
+``beta (1 + 2^-21)`` and ``lb (1 + 2^-21)`` finite in FP32 (``ValueError``
+otherwise); the tests cover ``beta`` in ``[2.5, 4]`` and ``lb`` in
+``[10, 40]``.
 
 Each stage may run one of several programs, chosen per call from the
 architecture, ``R`` and ``I`` (``R`` against a number of rows per SM, ``I``
@@ -89,10 +90,10 @@ host; every kernel runs on the current torch stream of the operands' device.
 The program of a call depends only on host integers (``R``, ``I``, the
 architecture and the SM count), so a CUDA graph replays the programs its
 capture chose.  A program's library builds at its first launch: before
-capturing a CUDA graph, run one eager call at each ``(R, I)`` the graph
-captures (or build every library of the architecture) so that no JIT build
-happens during capture.  This module imports its backend package on first use
-and reads no environment variable.
+capturing a CUDA graph, run one eager call at each ``(R, I)`` and stage the
+graph captures (or build every library of the architecture) so that no JIT
+build happens during capture.  This module imports its backend package on
+first use and reads no environment variable.
 
 Usage::
 

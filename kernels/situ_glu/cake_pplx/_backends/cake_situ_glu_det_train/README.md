@@ -77,7 +77,7 @@ computes and stores them; a segment past the row's last one reloads the last seg
 the last one stores nothing.  The CTAs stride over the blocks of rows, so a smaller grid runs every row.  Row offsets
 are 64-bit.  No program uses shared memory, a workspace, a cooperative launch or programmatic dependent launch.  The
 row count, the width, `beta`, `lb` and the strides are launch arguments, so one library per program and architecture
-serves every call.
+serves every call routed to it.
 
 The programs of a stage differ in their schedule only, and store the same bits for every input:
 

@@ -23,8 +23,10 @@ outputs):
 * ``cake``: ``cake_situ_glu_det_train_forward`` / ``_backward`` (one kernel each), the autograd entry
   ``cake_situ_glu_det`` for the ``ckpt`` stage, and the fused backward ``cake_situ_glu_det_train_backward_recompute``
   (one kernel) for the ``recompute`` and ``ckpt_fused`` stages.  A stage whose entry point the installed package lacks
-  prints as unavailable.  Per row, the arm records the program and the grid each Cake call routes to (``n/a`` when the
-  installed package exposes no route).
+  prints as unavailable.  Per row, the arm records the program and the grid of each of the package's stages
+  (``routes``: ``fwd``, ``bwd`` and ``ckpt``, the fused backward; ``n/a`` when the installed package exposes no route)
+  and prints, for each bench stage, the package-stage calls it makes with their programs and grids (``ckpt``: two
+  ``fwd`` calls and one ``bwd``; ``recompute``: one ``ckpt``; ``ckpt_fused``: one ``fwd`` and one ``ckpt``).
 * ``cudnn``: cuDNN frontend pointwise graphs of the SiTU activation, op for op as the frontend's gated MLP builds its
   ``situ`` activation and its derivative: ``gate_act = beta tanh(g / beta) sigmoid(g)``, ``up_act = lb tanh(u / lb)``,
   ``h = gate_act up_act``; ``d_gate = dh up_act ((1 - tg^2) s + beta tg s (1 - s))`` and
@@ -126,8 +128,9 @@ POINTS = ("262144:3072", "16380:6144", "16380:33792", "16380:3072", "65536:3072"
 BYTES_PER_ELEMENT = {"fwd": 6, "bwd": 10, "ckpt": 22, "recompute": 12, "ckpt_fused": 18}
 # The package's entry point of the fused backward, or None when the installed package has none.
 RECOMPUTE = getattr(cake_facade, "cake_situ_glu_det_train_backward_recompute", None)
-# The calls of each bench stage of the Cake arm, by the package's stage (its routes): ``ckpt`` runs two forwards and a
-# backward, ``ckpt_fused`` a forward and a fused backward.
+# The calls of each bench stage of the Cake arm, by the package's stage (the keys of the arm's ``routes``): ``ckpt``
+# runs two forwards and a backward, ``recompute`` one fused backward (the package's ``ckpt`` stage), ``ckpt_fused`` a
+# forward and a fused backward.
 CAKE_CALLS = {
     "fwd": ("fwd",),
     "bwd": ("bwd",),
@@ -414,8 +417,9 @@ def _ckpt_fused(x: types.SimpleNamespace) -> tuple:
 
 
 def cake_routes(x: types.SimpleNamespace) -> Any:
-    """The program and the grid of each of the package's stages for this row, from the backend registry's
-    ``route``, ``select`` and ``grid``; ``"n/a"`` when the installed package exposes no route."""
+    """The program and the grid of each of the package's stages (``fwd``, ``bwd``, ``ckpt``) for this row, from the
+    backend registry's ``route``, ``select`` and ``grid``; ``"n/a"`` when the installed package exposes no route.
+    :func:`routes_text` maps them to the bench stages (``CAKE_CALLS``)."""
     try:
         import cake_pplx._backends.cake_situ_glu_det_train.cake_jit as cake_jit  # noqa: PLC0415 - the family's registry
     except ImportError as exc:
@@ -433,6 +437,24 @@ def cake_routes(x: types.SimpleNamespace) -> Any:
         grid = cake_jit.grid(entry["program"], x.R, sm_count, entry["ctas_per_sm"])
         found[stage] = {"program": entry["program"], "grid": list(grid), "ctas_per_sm": entry["ctas_per_sm"]}
     return found
+
+
+def routes_text(routes: dict[str, Any], stages) -> str:
+    """Per bench stage of ``stages``, the package-stage calls it makes (``CAKE_CALLS``), each with its program and
+    grid from ``routes`` (:func:`cake_routes`); a call made twice is counted (``2 x fwd ...``)."""
+    cells = []
+    for stage in stages:
+        calls = CAKE_CALLS.get(stage, ())
+        parts = []
+        for call in dict.fromkeys(calls):
+            count = f"{calls.count(call)} x " if calls.count(call) > 1 else ""
+            entry = routes.get(call)
+            if isinstance(entry, dict):
+                parts.append(f"{count}{call} {entry['program']} grid {tuple(entry['grid'])}")
+            else:
+                parts.append(f"{count}{call} n/a")
+        cells.append(f"{stage}: " + " + ".join(parts))
+    return "; ".join(cells)
 
 
 def cake_arm(x: types.SimpleNamespace) -> dict[str, Any]:
@@ -1059,9 +1081,7 @@ def format_row(result: dict[str, Any], timers: tuple[str, ...]) -> list[str]:
         if "routes" in row:
             routes = row["routes"]
             if isinstance(routes, dict):
-                routes = "; ".join(
-                    f"{stage} {entry['program']} grid {tuple(entry['grid'])}" for stage, entry in routes.items()
-                )
+                routes = routes_text(routes, row["stages"])
             notes.append(f"- {name} routes: {routes}")
         for key in ("compile", "merged_gradient", "graphs", "scalars", "errors"):
             if row.get(key):
